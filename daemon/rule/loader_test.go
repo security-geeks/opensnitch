@@ -1,9 +1,11 @@
 package rule
 
 import (
+	"fmt"
 	"io"
 	"math/rand"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -16,6 +18,7 @@ func TestMain(m *testing.M) {
 	defer os.RemoveAll(tmpDir)
 	os.Exit(m.Run())
 }
+
 func TestRuleLoader(t *testing.T) {
 	t.Parallel()
 	t.Log("Test rules loader")
@@ -24,8 +27,8 @@ func TestRuleLoader(t *testing.T) {
 	dur1s := Duration("1s")
 	dummyOper, _ := NewOperator(Simple, false, OpTrue, "", list)
 	dummyOper.Compile()
-	inMem1sRule := Create("000-xxx-name", true, false, Allow, dur1s, dummyOper)
-	inMemUntilRestartRule := Create("000-aaa-name", true, false, Allow, Restart, dummyOper)
+	inMem1sRule := Create("000-xxx-name", "rule description xxx", true, false, false, Allow, dur1s, dummyOper)
+	inMemUntilRestartRule := Create("000-aaa-name", "rule description aaa", true, false, false, Allow, Restart, dummyOper)
 
 	l, err := NewLoader(false)
 	if err != nil {
@@ -38,27 +41,195 @@ func TestRuleLoader(t *testing.T) {
 	if err = l.Load("testdata/"); err != nil {
 		t.Error("Error loading test rules: ", err)
 	}
-
-	testNumRules(t, l, 2)
+	// we expect 6 valid rules (2 invalid), loaded from testdata/
+	testNumRules(t, l, 6)
 
 	if err = l.Add(inMem1sRule, false); err != nil {
 		t.Error("Error adding temporary rule")
 	}
-	testNumRules(t, l, 3)
+	testNumRules(t, l, 7)
 
 	// test auto deletion of temporary rule
 	time.Sleep(time.Second * 2)
-	testNumRules(t, l, 2)
+	testNumRules(t, l, 6)
 
 	if err = l.Add(inMemUntilRestartRule, false); err != nil {
 		t.Error("Error adding temporary rule (2)")
 	}
-	testNumRules(t, l, 3)
+	testNumRules(t, l, 7)
 	testRulesOrder(t, l)
 	testSortRules(t, l)
 	testFindMatch(t, l)
 	testFindEnabled(t, l)
 	testDurationChange(t, l)
+}
+
+func TestRuleLoaderInvalidRegexp(t *testing.T) {
+	t.Parallel()
+	t.Log("Test rules loader: invalid regexp")
+
+	l, err := NewLoader(true)
+	if err != nil {
+		t.Fail()
+	}
+	t.Run("loadRule() from disk test (simple)", func(t *testing.T) {
+		if err := l.loadRule("testdata/invalid-regexp.json"); err == nil {
+			t.Error("invalid regexp rule loaded: loadRule()")
+		}
+	})
+
+	t.Run("loadRule() from disk test (list)", func(t *testing.T) {
+		if err := l.loadRule("testdata/invalid-regexp-list.json"); err == nil {
+			t.Error("invalid regexp rule loaded: loadRule()")
+		}
+	})
+
+	var list []Operator
+	dur30m := Duration("30m")
+	opListData := `[{"type": "regexp", "operand": "process.path", "sensitive": false, "data": "^(/di(rmngr)$"}, {"type": "simple", "operand": "dest.port", "data": "53", "sensitive": false}]`
+	invalidRegexpOp, _ := NewOperator(List, false, OpList, opListData, list)
+	invalidRegexpRule := Create("invalid-regexp", "invalid rule description", true, false, false, Allow, dur30m, invalidRegexpOp)
+
+	t.Run("replaceUserRule() test list", func(t *testing.T) {
+		if err := l.replaceUserRule(invalidRegexpRule); err == nil {
+			t.Error("invalid regexp rule loaded: replaceUserRule()")
+		}
+	})
+}
+
+// Test rules of type operator.list. There're these scenarios:
+// - Enabled rules:
+//    * operator Data field is ignored if it contains the list of operators as json string.
+//    * the operarots list is expanded as json objecs under "list": []
+// For new rules (> v1.6.3), Data field will be empty.
+//
+// - Disabled rules
+//    * (old) the Data field contains the list of operators as json string, and the list of operarots is empty.
+//    * Data field empty, and the list of operators expanded.
+// In all cases the list of operators must be loaded.
+func TestRuleLoaderList(t *testing.T) {
+	l, err := NewLoader(true)
+	if err != nil {
+		t.Fail()
+	}
+
+	testRules := map[string]string{
+		"rule-with-operator-list":                          "testdata/rule-operator-list.json",
+		"rule-disabled-with-operators-list-as-json-string": "testdata/rule-disabled-operator-list.json",
+		"rule-disabled-with-operators-list-expanded":       "testdata/rule-disabled-operator-list-expanded.json",
+		"rule-with-operator-list-data-empty":               "testdata/rule-operator-list-data-empty.json",
+	}
+
+	for name, path := range testRules {
+		t.Run(fmt.Sprint("loadRule() ", path), func(t *testing.T) {
+			if err := l.loadRule(path); err != nil {
+				t.Error(fmt.Sprint("loadRule() ", path, " error:"), err)
+			}
+			t.Log("Test: List rule:", name, path)
+			r, found := l.rules[name]
+			if !found {
+				t.Error(fmt.Sprint("loadRule() ", path, " not in the list:"), l.rules)
+			}
+			// Starting from > v1.6.3, after loading a rule of type List, the field Operator.Data is emptied, if the Data contained the list of operators as json.
+			if len(r.Operator.List) != 2 {
+				t.Error(fmt.Sprint("loadRule() ", path, " operator List not loaded:"), r)
+			}
+			if r.Operator.List[0].Type != Simple ||
+				r.Operator.List[0].Operand != OpProcessPath ||
+				r.Operator.List[0].Data != "/usr/bin/telnet" {
+				t.Error(fmt.Sprint("loadRule() ", path, " operator List 0 not loaded:"), r)
+			}
+			if r.Operator.List[1].Type != Simple ||
+				r.Operator.List[1].Operand != OpDstPort ||
+				r.Operator.List[1].Data != "53" {
+				t.Error(fmt.Sprint("loadRule() ", path, " operator List 1 not loaded:"), r)
+			}
+		})
+	}
+}
+
+// TestRuleLoaderGetAllSnapshot exercises the slice/map race that used to
+// crash daemon startup with a large rule corpus: getClientConfig() called
+// GetAll() twice without holding any lock, so the map could grow between
+// len() and the for-range and the iterator would walk off the end of the
+// pre-sized slice (or panic with "concurrent map iteration and map write"
+// on bad luck).
+//
+// Verify GetAll() now returns a consistent snapshot: iterating it produces
+// exactly len(snapshot) entries, even while other goroutines are mutating
+// the underlying loader. Run with -race to also catch the underlying data
+// race on l.rules that this fix removes.
+func TestRuleLoaderGetAllSnapshot(t *testing.T) {
+	t.Parallel()
+
+	l, err := NewLoader(false)
+	if err != nil {
+		t.Fatal("NewLoader: ", err)
+	}
+
+	var emptyOps []Operator
+	op, _ := NewOperator(Simple, false, OpTrue, "", emptyOps)
+	if err := op.Compile(); err != nil {
+		t.Fatal("Compile: ", err)
+	}
+
+	// Pre-seed with some rules so iterations have something to do.
+	for i := 0; i < 100; i++ {
+		r := Create(fmt.Sprintf("seed-%04d", i), "", true, false, false, Allow, Restart, op)
+		if err := l.replaceUserRule(r); err != nil {
+			t.Fatal("seed replaceUserRule: ", err)
+		}
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Writers churn the map: add and remove rules continuously, exercising
+	// the same Lock()/Unlock() path as the daemon's loader during rule load.
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				name := fmt.Sprintf("churn-%d-%d", w, i)
+				r := Create(name, "", true, false, false, Allow, Restart, op)
+				_ = l.replaceUserRule(r)
+				if i&1 == 0 {
+					_ = l.Delete(name)
+				}
+			}
+		}(w)
+	}
+
+	// Readers do exactly what getClientConfig used to do incorrectly:
+	// observe len(), then iterate, and expect the two to agree.
+	for r := 0; r < 8; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				rules := l.GetAll()
+				n := len(rules)
+				count := 0
+				for range rules {
+					count++
+				}
+				if count != n {
+					t.Errorf("GetAll snapshot inconsistent: len=%d iterated=%d", n, count)
+					return
+				}
+			}
+		}()
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }
 
 func TestLiveReload(t *testing.T) {
@@ -136,26 +307,26 @@ func testNumRules(t *testing.T, l *Loader, num int) {
 }
 
 func testRulesOrder(t *testing.T, l *Loader) {
-	if l.rulesKeys[0] != "000-aaa-name" {
-		t.Error("Rules not in order (0): ", l.rulesKeys)
+	if l.activeRules[0] != "000-aaa-name" {
+		t.Error("Rules not in order (0): ", l.activeRules)
 	}
-	if l.rulesKeys[1] != "000-allow-chrome" {
-		t.Error("Rules not in order (1): ", l.rulesKeys)
+	if l.activeRules[1] != "000-allow-chrome" {
+		t.Error("Rules not in order (1): ", l.activeRules)
 	}
-	if l.rulesKeys[2] != "001-deny-chrome" {
-		t.Error("Rules not in order (2): ", l.rulesKeys)
+	if l.activeRules[2] != "001-deny-chrome" {
+		t.Error("Rules not in order (2): ", l.activeRules)
 	}
 }
 
 func testSortRules(t *testing.T, l *Loader) {
-	l.rulesKeys[1] = "001-deny-chrome"
-	l.rulesKeys[2] = "000-allow-chrome"
+	l.activeRules[1] = "001-deny-chrome"
+	l.activeRules[2] = "000-allow-chrome"
 	l.sortRules()
-	if l.rulesKeys[1] != "000-allow-chrome" {
-		t.Error("Rules not in order (1): ", l.rulesKeys)
+	if l.activeRules[1] != "000-allow-chrome" {
+		t.Error("Rules not in order (1): ", l.activeRules)
 	}
-	if l.rulesKeys[2] != "001-deny-chrome" {
-		t.Error("Rules not in order (2): ", l.rulesKeys)
+	if l.activeRules[2] != "001-deny-chrome" {
+		t.Error("Rules not in order (2): ", l.activeRules)
 	}
 }
 

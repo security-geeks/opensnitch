@@ -13,6 +13,7 @@ import (
 	"github.com/evilsocket/opensnitch/daemon/netlink"
 	"github.com/evilsocket/opensnitch/daemon/netstat"
 	"github.com/evilsocket/opensnitch/daemon/procmon"
+	"github.com/evilsocket/opensnitch/daemon/procmon/audit"
 	"github.com/evilsocket/opensnitch/daemon/procmon/ebpf"
 	"github.com/evilsocket/opensnitch/daemon/ui/protocol"
 
@@ -21,16 +22,17 @@ import (
 
 // Connection represents an outgoing connection.
 type Connection struct {
-	Protocol string
-	SrcIP    net.IP
-	SrcPort  uint
-	DstIP    net.IP
-	DstPort  uint
-	DstHost  string
-	Entry    *netstat.Entry
-	Process  *procmon.Process
+	Pkt     *netfilter.Packet
+	Entry   *netstat.Entry
+	Process *procmon.Process
 
-	pkt *netfilter.Packet
+	Protocol string
+	DstHost  string
+	SrcIP    net.IP
+	DstIP    net.IP
+
+	SrcPort uint
+	DstPort uint
 }
 
 var showUnknownCons = false
@@ -39,6 +41,7 @@ var showUnknownCons = false
 // process generated a connection.
 func Parse(nfp netfilter.Packet, interceptUnknown bool) *Connection {
 	showUnknownCons = interceptUnknown
+	log.Trace("Connection.Parse(): %v", nfp)
 
 	if nfp.IsIPv4() {
 		con, err := NewConnection(&nfp)
@@ -68,9 +71,10 @@ func Parse(nfp netfilter.Packet, interceptUnknown bool) *Connection {
 func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (cr *Connection, err error) {
 	// no errors but not enough info neither
 	if c.parseDirection(protoType) == false {
+		log.Trace("discarding connection (proto %s): %+v", protoType, c)
 		return nil, nil
 	}
-	log.Debug("new connection %s => %d:%v -> %v:%d uid: %d", c.Protocol, c.SrcPort, c.SrcIP, c.DstIP, c.DstPort, nfp.UID)
+	log.Debug("new connection %s => %d:%v -> %v (%s):%d uid: %d, mark: %x", c.Protocol, c.SrcPort, c.SrcIP, c.DstIP, c.DstHost, c.DstPort, nfp.UID, nfp.Mark)
 
 	c.Entry = &netstat.Entry{
 		Proto:   c.Protocol,
@@ -83,16 +87,49 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (
 	}
 
 	pid := -1
-	var uid int
+	uid := -1
 	if procmon.MethodIsEbpf() {
-		pid, uid, err = ebpf.GetPid(c.Protocol, c.SrcPort, c.SrcIP, c.DstIP, c.DstPort)
-		if err != nil {
-			log.Warning("ebpf warning: %v", err)
-			return nil, nil
+		swap := false
+		c.Process, swap, err = ebpf.GetPid(c.Protocol, c.SrcPort, c.SrcIP, c.DstIP, c.DstPort)
+		if swap {
+			c.swapFields()
 		}
+
+		if c.Process != nil {
+			c.Entry.UserId = c.Process.UID
+			return c, nil
+		}
+		if err != nil {
+			log.Debug("ebpf warning: %v", err)
+		}
+		log.Debug("[ebpf conn] PID not found via eBPF, falling back to proc")
+	} else if procmon.MethodIsAudit() {
+		if aevent := audit.GetEventByPid(pid); aevent != nil {
+			audit.Lock.RLock()
+			c.Process = procmon.NewProcessEmpty(pid, aevent.ProcName)
+			c.Process.Path = aevent.ProcPath
+			c.Process.ReadCmdline()
+			c.Process.CWD = aevent.ProcDir
+			audit.Lock.RUnlock()
+			// if the proc dir contains non alhpa-numeric chars the field is empty
+			if c.Process.CWD == "" {
+				c.Process.ReadCwd()
+			}
+			c.Process.ReadEnv()
+			c.Process.CleanPath()
+
+			procmon.EventsCache.Add(c.Process)
+			return c, nil
+		}
+		log.Debug("[auditd conn] PID not found via auditd, falling back to proc")
 	}
-	// sometimes when using eBPF the connection is not found, but falling back to legacy
-	// methods helps to find it and avoid "unknown/kernel pop-ups". TODO: investigate
+
+	// Sometimes when using eBPF, the PID is not found by the connection's parameters,
+	// but falling back to legacy methods helps to find it and avoid "unknown/kernel pop-ups".
+	//
+	// One of the reasons is because after coming back from suspend state, for some reason (bug?),
+	// gobpf/libbpf is unable to delete ebpf map entries, so when they reach the maximum capacity no
+	// more entries are added, nor updated.
 	if pid < 0 {
 		// 0. lookup uid and inode via netlink. Can return several inodes.
 		// 1. lookup uid and inode using /proc/net/(udp|tcp|udplite)
@@ -102,44 +139,35 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (
 		var inodeList []int
 		uid, inodeList = netlink.GetSocketInfo(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort)
 		if len(inodeList) == 0 {
-			if c.Entry = netstat.FindEntry(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort); c.Entry == nil {
-				return nil, fmt.Errorf("Could not find netstat entry for: %s", c)
-			}
-			if c.Entry.INode > 0 {
-				log.Debug("connection found in netstat: %v", c.Entry)
-				inodeList = append([]int{c.Entry.INode}, inodeList...)
-			}
-		}
-		if len(inodeList) == 0 {
-			log.Debug("<== no inodes found, applying default action.")
-			return nil, nil
+			procmon.GetInodeFromNetstat(c.Entry, &inodeList, c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort)
 		}
 
 		for n, inode := range inodeList {
 			pid = procmon.GetPIDFromINode(inode, fmt.Sprint(inode, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort))
 			if pid != -1 {
-				log.Debug("[%d] PID found %d", n, pid)
+				log.Debug("[%d] PID found %d [%d]", n, pid, inode)
 				c.Entry.INode = inode
 				break
 			}
 		}
 	}
 
-	if uid != -1 {
-		c.Entry.UserId = uid
-	} else if c.Entry.UserId == -1 && nfp.UID != 0xffffffff {
-		c.Entry.UserId = int(nfp.UID)
-	}
-
 	if pid == os.Getpid() {
 		// return a Process object with our PID, to be able to exclude our own connections
 		// (to the UI on a local socket for example)
-		c.Process = procmon.NewProcess(pid, "")
+		c.Process = procmon.NewProcessEmpty(pid, "")
 		return c, nil
 	}
 
-	if c.Process = procmon.FindProcess(pid, showUnknownCons); c.Process == nil {
-		return nil, fmt.Errorf("Could not find process by its pid %d for: %s", pid, c)
+	if nfp.UID != 0xffffffff {
+		uid = int(nfp.UID)
+	}
+	c.Entry.UserId = uid
+
+	if c.Process == nil {
+		if c.Process = procmon.FindProcess(pid, showUnknownCons); c.Process == nil {
+			return nil, fmt.Errorf("Could not find process by its pid %d for: %s", pid, c)
+		}
 	}
 
 	return c, nil
@@ -159,8 +187,9 @@ func NewConnection(nfp *netfilter.Packet) (c *Connection, err error) {
 		SrcIP:   ip.SrcIP,
 		DstIP:   ip.DstIP,
 		DstHost: dns.HostOr(ip.DstIP, ""),
-		pkt:     nfp,
+		Pkt:     nfp,
 	}
+
 	return newConnectionImpl(nfp, c, "")
 }
 
@@ -178,14 +207,14 @@ func NewConnection6(nfp *netfilter.Packet) (c *Connection, err error) {
 		SrcIP:   ip.SrcIP,
 		DstIP:   ip.DstIP,
 		DstHost: dns.HostOr(ip.DstIP, ""),
-		pkt:     nfp,
+		Pkt:     nfp,
 	}
 	return newConnectionImpl(nfp, c, "6")
 }
 
 func (c *Connection) parseDirection(protoType string) bool {
 	ret := false
-	if tcpLayer := c.pkt.Packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+	if tcpLayer := c.Pkt.Packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 		if tcp, ok := tcpLayer.(*layers.TCP); ok == true && tcp != nil {
 			c.Protocol = "tcp" + protoType
 			c.DstPort = uint(tcp.DstPort)
@@ -193,10 +222,10 @@ func (c *Connection) parseDirection(protoType string) bool {
 			ret = true
 
 			if tcp.DstPort == 53 {
-				c.getDomains(c.pkt, c)
+				c.getDomains(c.Pkt, c)
 			}
 		}
-	} else if udpLayer := c.pkt.Packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+	} else if udpLayer := c.Pkt.Packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
 		if udp, ok := udpLayer.(*layers.UDP); ok == true && udp != nil {
 			c.Protocol = "udp" + protoType
 			c.DstPort = uint(udp.DstPort)
@@ -204,14 +233,35 @@ func (c *Connection) parseDirection(protoType string) bool {
 			ret = true
 
 			if udp.DstPort == 53 {
-				c.getDomains(c.pkt, c)
+				c.getDomains(c.Pkt, c)
 			}
 		}
-	} else if udpliteLayer := c.pkt.Packet.Layer(layers.LayerTypeUDPLite); udpliteLayer != nil {
+	} else if udpliteLayer := c.Pkt.Packet.Layer(layers.LayerTypeUDPLite); udpliteLayer != nil {
 		if udplite, ok := udpliteLayer.(*layers.UDPLite); ok == true && udplite != nil {
 			c.Protocol = "udplite" + protoType
 			c.DstPort = uint(udplite.DstPort)
 			c.SrcPort = uint(udplite.SrcPort)
+			ret = true
+		}
+	} else if sctpLayer := c.Pkt.Packet.Layer(layers.LayerTypeSCTP); sctpLayer != nil {
+		if sctp, ok := sctpLayer.(*layers.SCTP); ok == true && sctp != nil {
+			c.Protocol = "sctp" + protoType
+			c.DstPort = uint(sctp.DstPort)
+			c.SrcPort = uint(sctp.SrcPort)
+			ret = true
+		}
+	} else if icmpLayer := c.Pkt.Packet.Layer(layers.LayerTypeICMPv4); icmpLayer != nil {
+		if icmp, ok := icmpLayer.(*layers.ICMPv4); ok == true && icmp != nil {
+			c.Protocol = "icmp"
+			c.DstPort = 0
+			c.SrcPort = 0
+			ret = true
+		}
+	} else if icmp6Layer := c.Pkt.Packet.Layer(layers.LayerTypeICMPv6); icmp6Layer != nil {
+		if icmp6, ok := icmp6Layer.(*layers.ICMPv6); ok == true && icmp6 != nil {
+			c.Protocol = "icmp" + protoType
+			c.DstPort = 0
+			c.SrcPort = 0
 			ret = true
 		}
 	}
@@ -219,12 +269,33 @@ func (c *Connection) parseDirection(protoType string) bool {
 	return ret
 }
 
+// swapFields swaps connection's fields.
+// Used to workaround an issue where outbound connections
+// have the fields swapped (procmon/ebpf/find.go).
+func (c *Connection) swapFields() {
+	oEntry := c.Entry
+	c.Entry = &netstat.Entry{
+		Proto:   c.Protocol,
+		SrcIP:   oEntry.DstIP,
+		DstIP:   oEntry.SrcIP,
+		SrcPort: oEntry.DstPort,
+		DstPort: oEntry.SrcPort,
+		UserId:  oEntry.UserId,
+		INode:   oEntry.INode,
+	}
+	c.SrcIP = oEntry.DstIP
+	c.DstIP = oEntry.SrcIP
+	c.DstPort = oEntry.SrcPort
+	c.SrcPort = oEntry.DstPort
+}
+
 func (c *Connection) getDomains(nfp *netfilter.Packet, con *Connection) {
 	domains := dns.GetQuestions(nfp)
-	if len(domains) > 0 {
-		for _, dns := range domains {
-			con.DstHost = dns
-		}
+	if len(domains) < 1 {
+		return
+	}
+	for _, dns := range domains {
+		con.DstHost = dns
 	}
 }
 
@@ -233,16 +304,16 @@ func (c *Connection) To() string {
 	if c.DstHost == "" {
 		return c.DstIP.String()
 	}
-	return c.DstHost
+	return fmt.Sprintf("%s (%s)", c.DstHost, c.DstIP)
 }
 
 func (c *Connection) String() string {
 	if c.Entry == nil {
-		return fmt.Sprintf("%s ->(%s)-> %s:%d", c.SrcIP, c.Protocol, c.To(), c.DstPort)
+		return fmt.Sprintf("%d:%s ->(%s)-> %s:%d", c.SrcPort, c.SrcIP, c.Protocol, c.To(), c.DstPort)
 	}
 
 	if c.Process == nil {
-		return fmt.Sprintf("%s (uid:%d) ->(%s)-> %s:%d", c.SrcIP, c.Entry.UserId, c.Protocol, c.To(), c.DstPort)
+		return fmt.Sprintf("%d:%s (uid:%d) ->(%s)-> %s:%d", c.SrcPort, c.SrcIP, c.Entry.UserId, c.Protocol, c.To(), c.DstPort)
 	}
 
 	return fmt.Sprintf("%s (%d) -> %s:%d (proto:%s uid:%d)", c.Process.Path, c.Process.ID, c.To(), c.DstPort, c.Protocol, c.Entry.UserId)
@@ -250,18 +321,22 @@ func (c *Connection) String() string {
 
 // Serialize returns a connection serialized.
 func (c *Connection) Serialize() *protocol.Connection {
+	c.Process.RLock()
+	defer c.Process.RUnlock()
 	return &protocol.Connection{
-		Protocol:    c.Protocol,
-		SrcIp:       c.SrcIP.String(),
-		SrcPort:     uint32(c.SrcPort),
-		DstIp:       c.DstIP.String(),
-		DstHost:     c.DstHost,
-		DstPort:     uint32(c.DstPort),
-		UserId:      uint32(c.Entry.UserId),
-		ProcessId:   uint32(c.Process.ID),
-		ProcessPath: c.Process.Path,
-		ProcessArgs: c.Process.Args,
-		ProcessEnv:  c.Process.Env,
-		ProcessCwd:  c.Process.CWD,
+		Protocol:         c.Protocol,
+		SrcIp:            c.SrcIP.String(),
+		SrcPort:          uint32(c.SrcPort),
+		DstIp:            c.DstIP.String(),
+		DstHost:          c.DstHost,
+		DstPort:          uint32(c.DstPort),
+		UserId:           uint32(c.Entry.UserId),
+		ProcessId:        uint32(c.Process.ID),
+		ProcessPath:      c.Process.Path,
+		ProcessArgs:      c.Process.Args,
+		ProcessEnv:       c.Process.Env,
+		ProcessCwd:       c.Process.CWD,
+		ProcessChecksums: c.Process.Checksums,
+		ProcessTree:      c.Process.Tree,
 	}
 }

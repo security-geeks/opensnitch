@@ -58,6 +58,11 @@ func ExpandPath(path string) (string, error) {
 	return "", nil
 }
 
+// IsAbsPath verifies if a path is absolute or not
+func IsAbsPath(path string) bool {
+	return path[0] == 47 // 47 == '/'
+}
+
 // GetFileModTime checks if a file has been modified.
 func GetFileModTime(filepath string) (time.Time, error) {
 	fi, err := os.Stat(filepath)
@@ -65,4 +70,9 @@ func GetFileModTime(filepath string) (time.Time, error) {
 		return time.Now(), fmt.Errorf("GetFileModTime() Invalid file")
 	}
 	return fi.ModTime(), nil
+}
+
+// ConcatStrings joins the provided strings.
+func ConcatStrings(args ...string) string {
+	return strings.Join(args, "")
 }

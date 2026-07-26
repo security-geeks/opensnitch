@@ -23,10 +23,11 @@ const (
 	FG_BLACK = "\033[30m"
 	FG_WHITE = "\033[97m"
 
-	BG_DGRAY  = "\033[100m"
+	BG_PURPLE = "\033[45m"
 	BG_RED    = "\033[41m"
 	BG_GREEN  = "\033[42m"
 	BG_YELLOW = "\033[43m"
+	BG_DGRAY  = "\033[100m"
 	BG_LBLUE  = "\033[104m"
 
 	RESET = "\033[0m"
@@ -40,6 +41,8 @@ const (
 	WARNING
 	ERROR
 	FATAL
+
+	TRACE = -1
 )
 
 //
@@ -48,10 +51,13 @@ var (
 	Output     = os.Stdout
 	StdoutFile = "/dev/stdout"
 	DateFormat = "2006-01-02 15:04:05"
-	MinLevel   = INFO
+	MinLevel   = int(INFO)
+	LogUTC     = true
+	LogMicro   = false
 
 	mutex  = &sync.RWMutex{}
 	labels = map[int]string{
+		TRACE:     "TRC",
 		DEBUG:     "DBG",
 		INFO:      "INF",
 		IMPORTANT: "IMP",
@@ -60,6 +66,7 @@ var (
 		FATAL:     "!!!",
 	}
 	colors = map[int]string{
+		TRACE:     FG_WHITE + BG_PURPLE,
 		DEBUG:     DIM + FG_BLACK + BG_DGRAY,
 		INFO:      FG_WHITE + BG_GREEN,
 		IMPORTANT: FG_WHITE + BG_LBLUE,
@@ -109,8 +116,8 @@ func Yellow(s string) string {
 
 // Raw prints out a text without colors
 func Raw(format string, args ...interface{}) {
-	mutex.Lock()
-	defer mutex.Unlock()
+	mutex.RLock()
+	defer mutex.RUnlock()
 	fmt.Fprintf(Output, format, args...)
 }
 
@@ -123,20 +130,58 @@ func SetLogLevel(newLevel int) {
 
 // GetLogLevel returns the current log level configured.
 func GetLogLevel() int {
-	mutex.Lock()
-	defer mutex.Unlock()
+	mutex.RLock()
+	defer mutex.RUnlock()
 
 	return MinLevel
 }
 
-// Log prints out a text with the given color and format
-func Log(level int, format string, args ...interface{}) {
+// SetLogUTC configures UTC timestamps
+func SetLogUTC(newLogUTC bool) {
 	mutex.Lock()
 	defer mutex.Unlock()
+	LogUTC = newLogUTC
+}
+
+// GetLogUTC returns the current config.
+func GetLogUTC() bool {
+	mutex.RLock()
+	defer mutex.RUnlock()
+
+	return LogUTC
+}
+
+// SetLogMicro configures microsecond timestamps
+func SetLogMicro(newLogMicro bool) {
+	mutex.Lock()
+	defer mutex.Unlock()
+	LogMicro = newLogMicro
+}
+
+// GetLogMicro returns the current config.
+func GetLogMicro() bool {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	return LogMicro
+}
+
+// Log prints out a text with the given color and format
+func Log(level int, format string, args ...interface{}) {
+	mutex.RLock()
+	defer mutex.RUnlock()
 	if level >= MinLevel {
 		label := labels[level]
 		color := colors[level]
-		when := time.Now().UTC().Format(DateFormat)
+		datefmt := DateFormat
+
+		if LogMicro {
+			datefmt = DateFormat + ".000000"
+		}
+		when := time.Now().UTC().Format(datefmt)
+		if LogUTC == false {
+			when = time.Now().Local().Format(datefmt)
+		}
 
 		what := fmt.Sprintf(format, args...)
 		if strings.HasSuffix(what, "\n") == false {
@@ -178,6 +223,11 @@ func Close() {
 	if Output != os.Stdout {
 		Output.Close()
 	}
+}
+
+// Trace is the log level for tracing purposes
+func Trace(format string, args ...interface{}) {
+	Log(TRACE, format, args...)
 }
 
 // Debug is the log level for debugging purposes

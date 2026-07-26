@@ -1,12 +1,12 @@
 package procmon
 
 import (
-	"fmt"
-	"os"
+	"net"
+	"strconv"
 	"time"
 
-	"github.com/evilsocket/opensnitch/daemon/core"
 	"github.com/evilsocket/opensnitch/daemon/log"
+	"github.com/evilsocket/opensnitch/daemon/netstat"
 	"github.com/evilsocket/opensnitch/daemon/procmon/audit"
 )
 
@@ -30,11 +30,26 @@ func getPIDFromAuditEvents(inode int, inodeKey string, expect string) (int, int)
 	return -1, -1
 }
 
+// GetInodeFromNetstat tries to obtain the inode of a connection from /proc/net/*
+func GetInodeFromNetstat(netEntry *netstat.Entry, inodeList *[]int, protocol string, srcIP net.IP, srcPort uint, dstIP net.IP, dstPort uint) bool {
+	if netEntry = netstat.FindEntry(protocol, srcIP, srcPort, dstIP, dstPort); netEntry == nil {
+		log.Debug("Could not find netstat entry for: (%s) %d:%s -> %s:%d", protocol, srcPort, srcIP, dstIP, dstPort)
+		return false
+	}
+	if netEntry.INode > 0 {
+		log.Debug("connection found in netstat: %#v", netEntry)
+		*inodeList = append([]int{netEntry.INode}, *inodeList...)
+		return true
+	}
+	log.Debug("<== no inodes found for this connection: %#v", netEntry)
+
+	return false
+}
+
 // GetPIDFromINode tries to get the PID from a socket inode following these steps:
 // 1. Get the PID from the cache of Inodes.
 // 2. Get the PID from the cache of PIDs.
 // 3. Look for the PID using one of these methods:
-//    - ftrace: listening processes execs/exits from /sys/kernel/debug/tracing/
 //    - audit:  listening for socket creation from auditd.
 //    - proc:   search /proc
 //
@@ -46,7 +61,7 @@ func GetPIDFromINode(inode int, inodeKey string) int {
 	}
 	start := time.Now()
 
-	expect := fmt.Sprintf("socket:[%d]", inode)
+	expect := "socket:[" + strconv.Itoa(inode) + "]"
 	if cachedPidInode := inodesCache.getPid(inodeKey); cachedPidInode != -1 {
 		log.Debug("Inode found in cache: %v %v %v %v", time.Since(start), inodesCache.getPid(inodeKey), inode, inodeKey)
 		return cachedPidInode
@@ -65,17 +80,8 @@ func GetPIDFromINode(inode int, inodeKey string) int {
 			log.Debug("PID found via audit events: %v, position: %d", time.Since(start), pos)
 			return aPid
 		}
-	} else if MethodIsFtrace() && IsWatcherAvailable() {
-		forEachProcess(func(pid int, path string, args []string) bool {
-			if inodeFound("/proc/", expect, inodeKey, inode, pid) {
-				found = pid
-				return true
-			}
-			// keep looping
-			return false
-		})
 	}
-	if found == -1 || methodIsProc() {
+	if found == -1 || MethodIsProc() {
 		found = lookupPidInProc("/proc/", expect, inodeKey, inode)
 	}
 	log.Debug("new pid lookup took (%d): %v", found, time.Since(start))
@@ -88,57 +94,19 @@ func GetPIDFromINode(inode int, inodeKey string) int {
 // to identify a process (cmdline, name, environment variables, etc).
 func FindProcess(pid int, interceptUnknown bool) *Process {
 	if interceptUnknown && pid < 0 {
-		return NewProcess(0, "")
+		return NewProcessEmpty(0, "")
 	}
 
-	if proc := findProcessInActivePidsCache(uint64(pid)); proc != nil {
-		return proc
+	if ev, _, found := EventsCache.IsInStore(pid, nil); found {
+		return &ev.Proc
 	}
 
-	if MethodIsAudit() {
-		if aevent := audit.GetEventByPid(pid); aevent != nil {
-			audit.Lock.RLock()
-			proc := NewProcess(pid, aevent.ProcPath)
-			proc.readCmdline()
-			proc.setCwd(aevent.ProcDir)
-			audit.Lock.RUnlock()
-			// if the proc dir contains non alhpa-numeric chars the field is empty
-			if proc.CWD == "" {
-				proc.readCwd()
-			}
-			proc.readEnv()
-			proc.cleanPath()
-
-			addToActivePidsCache(uint64(pid), proc)
-			return proc
-		}
-	}
-	// if the PID dir doesn't exist, the process may have exited or be a kernel connection
-	// XXX: can a kernel connection exist without an entry in ProcFS?
-	if core.Exists(fmt.Sprint("/proc/", pid)) == false {
-		log.Debug("PID can't be read /proc/", pid)
+	proc := NewProcessEmpty(pid, "")
+	if err := proc.GetDetails(); err != nil {
+		log.Debug("[%d] FindProcess() error: %s", pid, err)
 		return nil
 	}
 
-	linkName := fmt.Sprint("/proc/", pid, "/exe")
-	link, err := os.Readlink(linkName)
-	proc := NewProcess(pid, link)
-	proc.readCmdline()
-	proc.readCwd()
-	proc.readEnv()
-	proc.cleanPath()
-
-	if len(proc.Args) == 0 {
-		proc.readComm()
-		proc.Args = make([]string, 0)
-		proc.Args = append(proc.Args, proc.Comm)
-	}
-
-	// If the link to the binary can't be read, the PID may be of a kernel task
-	if err != nil || proc.Path == "" {
-		proc.Path = "Kernel connection"
-	}
-
-	addToActivePidsCache(uint64(pid), proc)
+	EventsCache.Add(proc)
 	return proc
 }

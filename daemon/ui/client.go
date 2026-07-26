@@ -9,8 +9,13 @@ import (
 	"github.com/evilsocket/opensnitch/daemon/conman"
 	"github.com/evilsocket/opensnitch/daemon/firewall/iptables"
 	"github.com/evilsocket/opensnitch/daemon/log"
+	"github.com/evilsocket/opensnitch/daemon/log/loggers"
+	"github.com/evilsocket/opensnitch/daemon/procmon"
 	"github.com/evilsocket/opensnitch/daemon/rule"
 	"github.com/evilsocket/opensnitch/daemon/statistics"
+	"github.com/evilsocket/opensnitch/daemon/tasks"
+	"github.com/evilsocket/opensnitch/daemon/ui/auth"
+	"github.com/evilsocket/opensnitch/daemon/ui/config"
 	"github.com/evilsocket/opensnitch/daemon/ui/protocol"
 
 	"github.com/fsnotify/fsnotify"
@@ -23,57 +28,62 @@ import (
 var (
 	configFile             = "/etc/opensnitchd/default-config.json"
 	dummyOperator, _       = rule.NewOperator(rule.Simple, false, rule.OpTrue, "", make([]rule.Operator, 0))
-	clientDisconnectedRule = rule.Create("ui.client.disconnected", true, false, rule.Allow, rule.Once, dummyOperator)
+	clientDisconnectedRule = rule.Create("ui.client.disconnected", "", true, false, false, rule.Allow, rule.Once, dummyOperator)
 	// While the GUI is connected, deny by default everything until the user takes an action.
-	clientConnectedRule = rule.Create("ui.client.connected", true, false, rule.Deny, rule.Once, dummyOperator)
-	clientErrorRule     = rule.Create("ui.client.error", true, false, rule.Allow, rule.Once, dummyOperator)
-	config              Config
+	clientConnectedRule = rule.Create("ui.client.connected", "", true, false, false, rule.Deny, rule.Once, dummyOperator)
+	clientErrorRule     = rule.Create("ui.client.error", "", true, false, false, rule.Allow, rule.Once, dummyOperator)
+
+	maxQueuedAlerts = 1024
+
+	TaskMgr *tasks.TaskManager
 )
-
-type serverConfig struct {
-	Address string `json:"Address"`
-	LogFile string `json:"LogFile"`
-}
-
-// Config holds the values loaded from configFile
-type Config struct {
-	sync.RWMutex
-	Server            serverConfig           `json:"Server"`
-	DefaultAction     string                 `json:"DefaultAction"`
-	DefaultDuration   string                 `json:"DefaultDuration"`
-	InterceptUnknown  bool                   `json:"InterceptUnknown"`
-	ProcMonitorMethod string                 `json:"ProcMonitorMethod"`
-	LogLevel          *uint32                `json:"LogLevel"`
-	Firewall          string                 `json:"Firewall"`
-	Stats             statistics.StatsConfig `json:"Stats"`
-}
 
 // Client holds the connection information of a client.
 type Client struct {
-	sync.RWMutex
-	clientCtx    context.Context
-	clientCancel context.CancelFunc
-
-	stats               *statistics.Statistics
-	rules               *rule.Loader
-	socketPath          string
-	isUnixSocket        bool
-	con                 *grpc.ClientConn
 	client              protocol.UIClient
-	configWatcher       *fsnotify.Watcher
 	streamNotifications protocol.UI_NotificationsClient
+	clientCtx           context.Context
+	clientCancel        context.CancelFunc
+	config              config.Config
+
+	loggers       *loggers.LoggerManager
+	stats         *statistics.Statistics
+	rules         *rule.Loader
+	con           *grpc.ClientConn
+	configWatcher *fsnotify.Watcher
+
+	alertsChan  chan protocol.Alert
+	isConnected chan bool
+
+	socketPath     string
+	unixSockPrefix string
+
 	//isAsking is set to true if the client is awaiting a decision from the GUI
-	isAsking bool
+	isAsking     bool
+	isUnixSocket bool
+	isPolling    bool
+
+	sync.RWMutex
 }
 
 // NewClient creates and configures a new client.
-func NewClient(socketPath string, stats *statistics.Statistics, rules *rule.Loader) *Client {
+func NewClient(socketPath, localConfigFile string, stats *statistics.Statistics, rules *rule.Loader, loggers *loggers.LoggerManager) *Client {
+	if localConfigFile != "" {
+		configFile = localConfigFile
+	}
 	c := &Client{
+		loggers:      loggers,
 		stats:        stats,
 		rules:        rules,
 		isUnixSocket: false,
 		isAsking:     false,
+		isConnected:  make(chan bool),
+		alertsChan:   make(chan protocol.Alert, maxQueuedAlerts),
 	}
+	c.config.Rules.Path = rules.Path
+	//for i := 0; i < 4; i++ {
+	go c.alertsDispatcher()
+
 	c.clientCtx, c.clientCancel = context.WithCancel(context.Background())
 
 	if watcher, err := fsnotify.NewWatcher(); err == nil {
@@ -83,46 +93,54 @@ func NewClient(socketPath string, stats *statistics.Statistics, rules *rule.Load
 	if socketPath != "" {
 		c.setSocketPath(c.getSocketPath(socketPath))
 	}
+	procmon.EventsCache.SetComputeChecksums(c.config.Rules.EnableChecksums)
+	rules.EnableChecksums(c.config.Rules.EnableChecksums)
 
-	go c.poller()
+	TaskMgr = tasks.NewTaskManager()
+	go c.monitorTaskManager(TaskMgr)
+	TaskMgr.LoadTaskFile(c.config.TasksOptions.ConfigPath)
+
 	return c
+}
+
+// Connect starts the connection poller
+func (c *Client) Connect() {
+	if c.isPolling {
+		return
+	}
+	c.isPolling = true
+	go c.poller()
 }
 
 // Close cancels the running tasks: pinging the server and (re)connection poller.
 func (c *Client) Close() {
 	c.clientCancel()
+	TaskMgr.Stop()
 }
 
 // ProcMonitorMethod returns the monitor method configured.
 // If it's not present in the config file, it'll return an empty string.
 func (c *Client) ProcMonitorMethod() string {
-	config.RLock()
-	defer config.RUnlock()
-	return config.ProcMonitorMethod
+	c.RLock()
+	defer c.RUnlock()
+	return c.config.ProcMonitorMethod
 }
 
 // InterceptUnknown returns
 func (c *Client) InterceptUnknown() bool {
-	config.RLock()
-	defer config.RUnlock()
-	return config.InterceptUnknown
-}
-
-// GetStatsConfig returns the stats config from disk
-func (c *Client) GetStatsConfig() statistics.StatsConfig {
-	config.RLock()
-	defer config.RUnlock()
-	return config.Stats
+	c.RLock()
+	defer c.RUnlock()
+	return c.config.InterceptUnknown
 }
 
 // GetFirewallType returns the firewall to use
 func (c *Client) GetFirewallType() string {
-	config.RLock()
-	defer config.RUnlock()
-	if config.Firewall == "" {
+	c.RLock()
+	defer c.RUnlock()
+	if c.config.Firewall == "" {
 		return iptables.Name
 	}
-	return config.Firewall
+	return c.config.Firewall
 }
 
 // DefaultAction returns the default configured action for
@@ -180,6 +198,11 @@ func (c *Client) poller() {
 			log.Info("Client.poller() exit, Done()")
 			goto Exit
 		default:
+			if c.getCurrentSocketPath() == "" {
+				log.Error("client.Server address not set, exiting")
+				goto Exit
+			}
+
 			isConnected := c.Connected()
 			if wasConnected != isConnected {
 				c.onStatusChange(isConnected)
@@ -195,7 +218,7 @@ func (c *Client) poller() {
 			if c.Connected() == true {
 				// if the client is connected and ready, send a ping
 				if err := c.ping(time.Now()); err != nil {
-					log.Warning("Error while pinging UI service: %s, state: %v", err, c.con.GetState())
+					log.Debug("Error while pinging UI service: %s, state: %v", err, c.con.GetState())
 				}
 			}
 
@@ -204,12 +227,20 @@ func (c *Client) poller() {
 	}
 Exit:
 	log.Info("uiClient exit")
+	c.Lock()
+	c.isPolling = false
+	c.Unlock()
 }
 
 func (c *Client) onStatusChange(connected bool) {
 	if connected {
 		log.Info("Connected to the UI service on %s", c.socketPath)
 		go c.Subscribe()
+
+		select {
+		case c.isConnected <- true:
+		default:
+		}
 	} else {
 		log.Error("Connection to the UI service lost.")
 		c.disconnect()
@@ -230,6 +261,7 @@ func (c *Client) connect() (err error) {
 	}
 
 	if err := c.openSocket(); err != nil {
+		log.Debug("connect() %s", err)
 		c.disconnect()
 		return err
 	}
@@ -244,10 +276,14 @@ func (c *Client) openSocket() (err error) {
 	c.Lock()
 	defer c.Unlock()
 
+	dialOption, err := auth.New(&c.config)
+	if err != nil {
+		return fmt.Errorf("Invalid client auth options: %s", err)
+	}
 	if c.isUnixSocket {
-		c.con, err = grpc.Dial(c.socketPath, grpc.WithInsecure(),
+		c.con, err = grpc.Dial(c.socketPath, dialOption,
 			grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
-				return net.DialTimeout("unix", addr, timeout)
+				return net.DialTimeout(c.unixSockPrefix, addr, timeout)
 			}))
 	} else {
 		// https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
@@ -260,7 +296,7 @@ func (c *Client) openSocket() (err error) {
 			PermitWithoutStream: true,
 		}
 
-		c.con, err = grpc.Dial(c.socketPath, grpc.WithInsecure(), grpc.WithKeepaliveParams(kacp))
+		c.con, err = grpc.Dial(c.socketPath, dialOption, grpc.WithKeepaliveParams(kacp))
 	}
 
 	return err
@@ -270,12 +306,16 @@ func (c *Client) disconnect() {
 	c.Lock()
 	defer c.Unlock()
 
-	c.client = nil
+	select {
+	case c.isConnected <- false:
+	default:
+	}
 	if c.con != nil {
 		c.con.Close()
 		c.con = nil
 		log.Debug("client.disconnect()")
 	}
+	c.client = nil
 }
 
 func (c *Client) ping(ts time.Time) (err error) {
@@ -286,14 +326,21 @@ func (c *Client) ping(ts time.Time) (err error) {
 	c.Lock()
 	defer c.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	reqID := uint64(ts.UnixNano())
+	serializedStats := c.stats.Serialize()
+	if serializedStats == nil {
+		log.Trace("client, no stats")
+		return nil
+	}
 
+	reqID := uint64(ts.UnixNano())
 	pReq := &protocol.PingRequest{
 		Id:    reqID,
-		Stats: c.stats.Serialize(),
+		Stats: serializedStats,
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
 	c.stats.RLock()
 	pong, err := c.client.Ping(ctx, pReq)
 	c.stats.RUnlock()
@@ -329,6 +376,19 @@ func (c *Client) Ask(con *conman.Connection) *rule.Rule {
 		return nil
 	}
 	return r
+}
+
+// PostAlert queues a new message to be delivered to the server
+func (c *Client) PostAlert(atype protocol.Alert_Type, awhat protocol.Alert_What, action protocol.Alert_Action, prio protocol.Alert_Priority, data interface{}) {
+	if len(c.alertsChan) > maxQueuedAlerts-1 {
+		// pop oldest alert if channel is full
+		log.Debug("PostAlert() queue full, popping alert (%d)", len(c.alertsChan))
+		<-c.alertsChan
+	}
+	if c.Connected() == false {
+		log.Debug("UI not connected, queueing alert: %d", len(c.alertsChan))
+	}
+	c.alertsChan <- *NewAlert(atype, awhat, action, prio, data)
 }
 
 func (c *Client) monitorConfigWorker() {

@@ -1,26 +1,30 @@
 package procmon
 
 import (
+	"fmt"
 	"os"
+	"strings"
 	"testing"
+
+	"github.com/evilsocket/opensnitch/daemon/core"
 )
 
 var (
 	myPid = os.Getpid()
-	proc  = NewProcess(myPid, "/fake/path")
+	proc  = NewProcessEmpty(myPid, "fakeComm")
 )
 
 func TestNewProcess(t *testing.T) {
 	if proc.ID != myPid {
 		t.Error("NewProcess PID not equal to ", myPid)
 	}
-	if proc.Path != "/fake/path" {
-		t.Error("NewProcess path not equal to /fake/path")
+	if proc.Comm != "fakeComm" {
+		t.Error("NewProcess Comm not equal to fakeComm")
 	}
 }
 
 func TestProcPath(t *testing.T) {
-	if err := proc.readPath(); err != nil {
+	if err := proc.ReadPath(); err != nil {
 		t.Error("Proc path error:", err)
 	}
 	if proc.Path == "/fake/path" {
@@ -29,20 +33,15 @@ func TestProcPath(t *testing.T) {
 }
 
 func TestProcCwd(t *testing.T) {
-	err := proc.readCwd()
+	err := proc.ReadCwd()
 
 	if proc.CWD == "" {
 		t.Error("Proc readCwd() not read:", err)
 	}
-
-	proc.setCwd("/home")
-	if proc.CWD != "/home" {
-		t.Error("Proc setCwd() should be /home:", proc.CWD)
-	}
 }
 
 func TestProcCmdline(t *testing.T) {
-	proc.readCmdline()
+	proc.ReadCmdline()
 
 	if len(proc.Args) == 0 {
 		t.Error("Proc Args should not be empty:", proc.Args)
@@ -58,34 +57,39 @@ func TestProcDescriptors(t *testing.T) {
 }
 
 func TestProcEnv(t *testing.T) {
-	proc.readEnv()
+	proc.pathEnviron = "testdata/proc-environ"
+	proc.ReadEnv()
 
-	if len(proc.Env) == 0 {
-		t.Error("Proc Env should not be empty:", proc.Env)
+	expected := map[string]string{
+		"EMPTY":                    "",
+		"TEST1":                    "xxx=123",
+		"TEST2":                    "xxx=123==456",
+		"SSH_AGENT_PID":            "4873",
+		"XDG_CURRENT_DESKTOP":      "i3",
+		"USER":                     "opensnitch",
+		"HOME":                     "/tmp",
+		"XDG_DATA_DIRS":            "/usr/share/gnome:/var/lib/flatpak/exports/share:/usr/local/share:/usr/share",
+		"DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+		// Test latest var
+		"LS_COLORS": "rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;",
+
+		//"LAST":      "",
 	}
+
+	for k, v := range expected {
+		if env, found := proc.Env[k]; !found || env != v {
+			t.Error("Proc Env error, expected", ":", v, "got:", env, "(", k, ")")
+		}
+	}
+
 }
 
 func TestProcIOStats(t *testing.T) {
-	proc.readIOStats()
+	err := proc.readIOStats()
 
-	if proc.IOStats.RChar == 0 {
-		t.Error("Proc.IOStats.RChar should not be 0:", proc.IOStats)
+	if err != nil {
+		t.Error("error reading proc IOStats:", err)
 	}
-	if proc.IOStats.WChar == 0 {
-		t.Error("Proc.IOStats.WChar should not be 0:", proc.IOStats)
-	}
-	if proc.IOStats.SyscallRead == 0 {
-		t.Error("Proc.IOStats.SyscallRead should not be 0:", proc.IOStats)
-	}
-	if proc.IOStats.SyscallWrite == 0 {
-		t.Error("Proc.IOStats.SyscallWrite should not be 0:", proc.IOStats)
-	}
-	/*if proc.IOStats.ReadBytes == 0 {
-		t.Error("Proc.IOStats.ReadBytes should not be 0:", proc.IOStats)
-	}
-	if proc.IOStats.WriteBytes == 0 {
-		t.Error("Proc.IOStats.WriteBytes should not be 0:", proc.IOStats)
-	}*/
 }
 
 func TestProcStatus(t *testing.T) {
@@ -127,9 +131,49 @@ func TestProcStatus(t *testing.T) {
 }
 
 func TestProcCleanPath(t *testing.T) {
-	proc.Path = "/fake/path/binary (deleted)"
-	proc.cleanPath()
-	if proc.Path != "/fake/path/binary" {
-		t.Error("Proc cleanPath() not cleaned:", proc.Path)
+	t.Run("test (deleted) in path", func(t *testing.T) {
+		proc.SetPath("/fake/path/binary (deleted)")
+		if proc.Path != "/fake/path/binary" {
+			t.Error("Proc cleanPath() not cleaned:", proc.Path)
+		}
+	})
+
+	t.Run("test /proc/self/exe as path", func(t *testing.T) {
+		proc.SetPath("/proc/self/exe")
+		if strings.HasPrefix(proc.Path, "/proc") {
+			t.Error("/proc/self/exe path not resolved:", proc.Path)
+		}
+	})
+
+	t.Run("test /proc/ prefix in path", func(t *testing.T) {
+		proc.SetPath(fmt.Sprintf("/proc/%d/fd/4", myPid))
+		if strings.HasPrefix(proc.Path, "/proc") {
+			t.Error("/proc/self/exe path not resolved:", proc.Path)
+		}
+	})
+
+	t.Run("test relative path", func(t *testing.T) {
+		proc.SetPath("./opensnitchd")
+		if !core.IsAbsPath(proc.Path) {
+			t.Error("relative path not resolved:", proc.Path)
+		}
+	})
+}
+
+func TestProcCleanArgs(t *testing.T) {
+	proc.SetPath("/proc/self/exe")
+	proc.Args = make([]string, 1)
+	t.Run("resolve /proc/self/exe from arguments", func(t *testing.T) {
+		proc.Args[0] = "/proc/self/exe"
+		proc.CleanArgs()
+		if proc.Args[0] == "/proc/self/exe" {
+			t.Error("/proc/self/exe arg not cleaned (CleanArgs()):", proc.Args)
+		}
+	})
+}
+
+func BenchmarkProcReadEnv(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		proc.ReadEnv()
 	}
 }

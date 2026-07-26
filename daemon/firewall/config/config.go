@@ -5,64 +5,137 @@
 // The firewall rules defined by the user are reloaded in these cases:
 // - When the file system-fw.json changes.
 // - When the firewall rules are not present when listing them.
-//
 package config
 
 import (
+	"context"
 	"encoding/json"
 	"io/ioutil"
+	"os"
 	"sync"
 
+	"github.com/evilsocket/opensnitch/daemon/firewall/common"
 	"github.com/evilsocket/opensnitch/daemon/log"
 	"github.com/fsnotify/fsnotify"
 )
 
-type callback func()
+var (
+	// DefaultConfigFile ..
+	DefaultConfigFile = "/etc/opensnitchd/system-fw.json"
+)
+
+// ExprValues holds the statements' options:
+// "Name": "ct",
+// "Values": [
+// {
+//   "Key":   "state",
+//   "Value": "established"
+// },
+// {
+//   "Key":   "state",
+//   "Value": "related"
+// }]
+type ExprValues struct {
+	Key   string
+	Value string
+}
+
+// ExprStatement holds the definition of matches to use against connections.
+//{
+//	"Op": "!=",
+//	"Name": "tcp",
+//	"Values": [
+//		{
+//			"Key": "dport",
+// 			"Value": "443"
+//		}
+//	]
+//}
+type ExprStatement struct {
+	Op     string        // ==, !=, ... Only one per expression set.
+	Name   string        // tcp, udp, ct, daddr, log, ...
+	Values []*ExprValues // dport 8000
+}
+
+// Expressions holds the array of expressions that create the rules
+type Expressions struct {
+	Statement *ExprStatement
+}
 
 // FwRule holds the fields of a rule
 type FwRule struct {
-	sync.RWMutex
-
+	*sync.RWMutex
+	// we need to keep old fields in the struct. Otherwise when receiving a conf from the GUI, the legacy rules would be deleted.
+	Chain            string // TODO: deprecated, remove
+	Table            string // TODO: deprecated, remove
+	Parameters       string // TODO: deprecated, remove
+	UUID             string
 	Description      string
-	Table            string
-	Chain            string
-	Parameters       string
 	Target           string
 	TargetParameters string
+	Expressions      []*Expressions
+	Position         uint64 `json:",string"`
+	Enabled          bool
+}
+
+// FwChain holds the information that defines a firewall chain.
+// It also contains the firewall table definition that it belongs to.
+type FwChain struct {
+	// table fields
+	Table  string
+	Family string
+	// chain fields
+	Name        string
+	Description string
+	Priority    string
+	Type        string
+	Hook        string
+	Policy      string
+	Rules       []*FwRule
+}
+
+// IsInvalid checks if the chain has been correctly configured.
+func (fc *FwChain) IsInvalid() bool {
+	return fc.Name == "" || fc.Family == "" || fc.Table == ""
 }
 
 type rulesList struct {
-	sync.RWMutex
-
 	Rule *FwRule
+}
+
+type chainsList struct {
+	Rule   *FwRule // TODO: deprecated, remove
+	Chains []*FwChain
 }
 
 // SystemConfig holds the list of rules to be added to the system
 type SystemConfig struct {
+	SystemRules []*chainsList
 	sync.RWMutex
-	SystemRules []*rulesList
+	Version uint32
+	Enabled bool
 }
 
 // Config holds the functionality to re/load the firewall configuration from disk.
 // This is the configuration to manage the system firewall (iptables, nftables).
 type Config struct {
-	sync.Mutex
-
-	file            string
-	watcher         *fsnotify.Watcher
-	monitorExitChan chan bool
-	SysConfig       SystemConfig
-
-	// subscribe to this channel to receive config reload events
-	ReloadConfChan chan bool
+	watcher       *fsnotify.Watcher
+	ctx           context.Context
+	cancelMonitor context.CancelFunc
 
 	// preloadCallback is called before reloading the configuration,
 	// in order to delete old fw rules.
-	preloadCallback callback
+	preloadCallback func()
+	// reloadCallback is called after the configuration is written.
+	reloadCallback func()
+	// preload will be called after daemon startup, whilst reload when a modification is performed.
+	file      string
+	SysConfig SystemConfig
+	sync.Mutex
 }
 
 // NewSystemFwConfig initializes config fields
-func (c *Config) NewSystemFwConfig(preLoadCb callback) (*Config, error) {
+func (c *Config) NewSystemFwConfig(configPath string, preLoadCb, reLoadCb func()) (*Config, error) {
 	var err error
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -73,45 +146,59 @@ func (c *Config) NewSystemFwConfig(preLoadCb callback) (*Config, error) {
 	c.Lock()
 	defer c.Unlock()
 
-	c.file = "/etc/opensnitchd/system-fw.json"
-	c.monitorExitChan = make(chan bool, 1)
+	c.file = configPath
+	c.ctx, c.cancelMonitor = context.WithCancel(context.Background())
 	c.preloadCallback = preLoadCb
+	c.reloadCallback = reLoadCb
 	c.watcher = watcher
-	c.ReloadConfChan = make(chan bool, 1)
 	return c, nil
 }
 
+// SetConfigFile sets the absolute path to the configuration file to use.
+// If it's empty, it'll be ignored (when changing the fw type for example).
+func (c *Config) SetConfigFile(file string) {
+	if file == "" {
+		log.Debug("Firewall configuration file not provided, ignoring")
+		return
+	}
+	c.file = file
+}
+
 // LoadDiskConfiguration reads and loads the firewall configuration from disk
-func (c *Config) LoadDiskConfiguration(reload bool) {
+func (c *Config) LoadDiskConfiguration(reload bool) error {
 	c.Lock()
 	defer c.Unlock()
 
 	raw, err := ioutil.ReadFile(c.file)
 	if err != nil {
 		log.Error("Error reading firewall configuration from disk %s: %s", c.file, err)
-		return
+		return err
 	}
 
-	c.loadConfiguration(raw)
+	if err = c.loadConfiguration(raw); err != nil {
+		return err
+	}
 	// we need to monitor the configuration file for changes, regardless if it's
 	// malformed or not.
 	c.watcher.Remove(c.file)
 	if err := c.watcher.Add(c.file); err != nil {
 		log.Error("Could not watch firewall configuration: %s", err)
-		return
+		return err
 	}
 
 	if reload {
-		c.ReloadConfChan <- true
-		return
+		c.reloadCallback()
+		return nil
 	}
 
 	go c.monitorConfigWorker()
+
+	return nil
 }
 
 // loadConfigutation reads the system firewall rules from disk.
 // Then the rules are added based on the configuration defined.
-func (c *Config) loadConfiguration(rawConfig []byte) {
+func (c *Config) loadConfiguration(rawConfig []byte) error {
 	c.SysConfig.Lock()
 	defer c.SysConfig.Unlock()
 
@@ -121,20 +208,26 @@ func (c *Config) loadConfiguration(rawConfig []byte) {
 	if err := json.Unmarshal(rawConfig, &c.SysConfig); err != nil {
 		// we only log the parser error, giving the user a chance to write a valid config
 		log.Error("Error parsing firewall configuration %s: %s", c.file, err)
+		return err
 	}
 	log.Info("fw configuration loaded")
+
+	return nil
 }
 
-func (c *Config) saveConfiguration(rawConfig string) error {
-	conf, err := json.Marshal([]byte(rawConfig))
+// SaveConfiguration saves configuration to disk.
+// This event dispatches a reload of the configuration.
+func (c *Config) SaveConfiguration(rawConfig string) error {
+	conf, err := json.MarshalIndent([]byte(rawConfig), "  ", "  ")
 	if err != nil {
 		log.Error("saving json firewall configuration: %s %s", err, conf)
 		return err
 	}
 
-	c.loadConfiguration([]byte(rawConfig))
-
-	if err = ioutil.WriteFile(c.file, []byte(rawConfig), 0644); err != nil {
+	if err = os.Chmod(c.file, 0600); err != nil {
+		log.Warning("unable to set system-fw.json permissions: %s", err)
+	}
+	if err = ioutil.WriteFile(c.file, []byte(rawConfig), 0600); err != nil {
 		log.Error("writing firewall configuration to disk: %s", err)
 		return err
 	}
@@ -146,14 +239,7 @@ func (c *Config) StopConfigWatcher() {
 	c.Lock()
 	defer c.Unlock()
 
-	if c.monitorExitChan != nil {
-		c.monitorExitChan <- true
-		close(c.monitorExitChan)
-	}
-	if c.ReloadConfChan != nil {
-		c.ReloadConfChan <- false // exit
-		close(c.ReloadConfChan)
-	}
+	c.cancelMonitor()
 
 	if c.watcher != nil {
 		c.watcher.Remove(c.file)
@@ -164,36 +250,14 @@ func (c *Config) StopConfigWatcher() {
 func (c *Config) monitorConfigWorker() {
 	for {
 		select {
-		case <-c.monitorExitChan:
+		case <-c.ctx.Done():
 			goto Exit
 		case event := <-c.watcher.Events:
 			if (event.Op&fsnotify.Write == fsnotify.Write) || (event.Op&fsnotify.Remove == fsnotify.Remove) {
-				c.LoadDiskConfiguration(true)
+				c.LoadDiskConfiguration(common.ReloadConf)
 			}
 		}
 	}
 Exit:
 	log.Debug("stop monitoring firewall config file")
-	c.Lock()
-	c.monitorExitChan = nil
-	c.Unlock()
-}
-
-// MonitorSystemFw waits for configuration reloads.
-func (c *Config) MonitorSystemFw(reloadCallback callback) {
-	for {
-		select {
-		case reload := <-c.ReloadConfChan:
-			if reload {
-				reloadCallback()
-			} else {
-				goto Exit
-			}
-		}
-	}
-Exit:
-	log.Info("iptables, stop monitoring system fw rules")
-	c.Lock()
-	c.ReloadConfChan = nil
-	c.Unlock()
 }

@@ -8,12 +8,58 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+func (ipt *Iptables) getBypassQueue() string {
+	if !ipt.bypassQueue {
+		return ""
+	}
+
+	return "--queue-bypass"
+}
+
+// BuildQueueDNSRule returns the iptables rule arguments for queueing DNS responses.
+func BuildQueueDNSRule(queueNum uint16, bypass bool) []string {
+	rule := []string{
+		"INPUT",
+		"--protocol", "udp",
+		"--sport", "53",
+		"-j", "NFQUEUE",
+		"--queue-num", fmt.Sprintf("%d", queueNum),
+	}
+	if bypass {
+		rule = append(rule, "--queue-bypass")
+	}
+	return rule
+}
+
+// BuildQueueConnectionsRule returns the iptables rule arguments for queueing connections.
+func BuildQueueConnectionsRule(queueNum uint16, bypass bool) []string {
+	rule := []string{
+		"OUTPUT",
+		"-t", "mangle",
+		"-m", "conntrack",
+		"--ctstate", "NEW,RELATED",
+		"-j", "NFQUEUE",
+		"--queue-num", fmt.Sprintf("%d", queueNum),
+	}
+	if bypass {
+		rule = append(rule, "--queue-bypass")
+	}
+	return rule
+}
+
 // RunRule inserts or deletes a firewall rule.
 func (ipt *Iptables) RunRule(action Action, enable bool, logError bool, rule []string) (err4, err6 error) {
 	if enable == false {
 		action = "-D"
 	}
 
+	// If the last argument of the rule is "", the iptables command fails.
+	// So if the user selects "QueueBypass: false", delete the last token of the rule,
+	// which will be "".
+	args := len(rule)
+	if rule[args-1] == "" {
+		rule = append(rule[:args-1], rule[args:]...)
+	}
 	rule = append([]string{string(action)}, rule...)
 
 	ipt.Lock()
@@ -43,29 +89,14 @@ func (ipt *Iptables) RunRule(action Action, enable bool, logError bool, rule []s
 // of resolved domains.
 // INPUT --protocol udp --sport 53 -j NFQUEUE --queue-num 0 --queue-bypass
 func (ipt *Iptables) QueueDNSResponses(enable bool, logError bool) (err4, err6 error) {
-	return ipt.RunRule(INSERT, enable, logError, []string{
-		"INPUT",
-		"--protocol", "udp",
-		"--sport", "53",
-		"-j", "NFQUEUE",
-		"--queue-num", fmt.Sprintf("%d", ipt.QueueNum),
-		"--queue-bypass",
-	})
+	return ipt.RunRule(INSERT, enable, logError, BuildQueueDNSRule(ipt.QueueNum, ipt.bypassQueue))
 }
 
 // QueueConnections inserts the firewall rule which redirects connections to us.
-// They are queued until the user denies/accept them, or reaches a timeout.
+// Connections are queued until the user denies/accept them, or reaches a timeout.
 // OUTPUT -t mangle -m conntrack --ctstate NEW,RELATED -j NFQUEUE --queue-num 0 --queue-bypass
 func (ipt *Iptables) QueueConnections(enable bool, logError bool) (error, error) {
-	err4, err6 := ipt.RunRule(INSERT, enable, logError, []string{
-		"OUTPUT",
-		"-t", "mangle",
-		"-m", "conntrack",
-		"--ctstate", "NEW,RELATED",
-		"-j", "NFQUEUE",
-		"--queue-num", fmt.Sprintf("%d", ipt.QueueNum),
-		"--queue-bypass",
-	})
+	err4, err6 := ipt.RunRule(ADD, enable, logError, BuildQueueConnectionsRule(ipt.QueueNum, ipt.bypassQueue))
 	if enable {
 		// flush conntrack as soon as netfilter rule is set. This ensures that already-established
 		// connections will go to netfilter queue.

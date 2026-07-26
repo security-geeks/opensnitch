@@ -1,13 +1,15 @@
 package statistics
 
 import (
-	"fmt"
+	"context"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/evilsocket/opensnitch/daemon/conman"
 	"github.com/evilsocket/opensnitch/daemon/core"
 	"github.com/evilsocket/opensnitch/daemon/log"
+	"github.com/evilsocket/opensnitch/daemon/log/loggers"
 	"github.com/evilsocket/opensnitch/daemon/rule"
 	"github.com/evilsocket/opensnitch/daemon/ui/protocol"
 )
@@ -16,6 +18,7 @@ import (
 type StatsConfig struct {
 	MaxEvents int `json:"MaxEvents"`
 	MaxStats  int `json:"MaxStats"`
+	Workers   int `json:"Workers"`
 }
 
 type conEvent struct {
@@ -27,35 +30,45 @@ type conEvent struct {
 // Statistics holds the connections and statistics the daemon intercepts.
 // The connections are stored in the Events slice.
 type Statistics struct {
-	sync.RWMutex
-
+	ctx          context.Context
+	cancel       context.CancelFunc
 	Started      time.Time
-	DNSResponses int
-	Connections  int
-	Ignored      int
-	Accepted     int
-	Dropped      int
-	RuleHits     int
-	RuleMisses   int
-	Events       []*Event
-	ByProto      map[string]uint64
-	ByAddress    map[string]uint64
-	ByHost       map[string]uint64
-	ByPort       map[string]uint64
-	ByUID        map[string]uint64
+	logger       *loggers.LoggerManager
+	rules        *rule.Loader
 	ByExecutable map[string]uint64
+	ByUID        map[string]uint64
+	ByAddress    map[string]uint64
+	ByPort       map[string]uint64
+	ByHost       map[string]uint64
+	ByProto      map[string]uint64
+	jobs         chan conEvent
+	Events       []*Event
 
-	rules *rule.Loader
-	jobs  chan conEvent
+	RuleHits     int
+	Accepted     int
+	Ignored      int
+	Connections  int
+	RuleMisses   int
+	DNSResponses int
 	// max number of events to keep in the buffer
 	maxEvents int
 	// max number of entries for each By* map
-	maxStats int
+	maxStats   int
+	maxWorkers int
+	Dropped    int
+
+	// flag to indicate if there're new events available
+	newEvents bool
+
+	sync.RWMutex
 }
 
 // New returns a new Statistics object and initializes the go routines to update the stats.
 func New(rules *rule.Loader) (stats *Statistics) {
+	ctx, cancel := context.WithCancel(context.Background())
 	stats = &Statistics{
+		ctx:          ctx,
+		cancel:       cancel,
 		Started:      time.Now(),
 		Events:       make([]*Event, 0),
 		ByProto:      make(map[string]uint64),
@@ -71,24 +84,55 @@ func New(rules *rule.Loader) (stats *Statistics) {
 		maxStats:  25,
 	}
 
-	go stats.eventWorker(0)
-	go stats.eventWorker(1)
-	go stats.eventWorker(2)
-	go stats.eventWorker(3)
-
 	return stats
 }
 
-// SetConfig configures the max events to keep in the backlog before sending
+// SetLoggers sets the configured loggers where we'll write the events.
+func (s *Statistics) SetLoggers(loggermgr *loggers.LoggerManager) {
+	s.Lock()
+	s.logger = loggermgr
+	s.Unlock()
+}
+
+// SetLimits configures the max events to keep in the backlog before sending
 // the stats to the UI, or while the UI is not connected.
 // if the backlog is full, it'll be shifted by one.
-func (s *Statistics) SetConfig(config StatsConfig) {
+func (s *Statistics) SetLimits(config StatsConfig) {
+	s.cancel()
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 	if config.MaxEvents > 0 {
 		s.maxEvents = config.MaxEvents
 	}
 	if config.MaxStats > 0 {
 		s.maxStats = config.MaxStats
 	}
+	s.maxWorkers = config.Workers
+	if s.maxWorkers == 0 {
+		s.maxWorkers = 6
+	}
+	log.Info("Stats, max events: %d, max stats: %d, max workers: %d", s.maxStats, s.maxEvents, s.maxWorkers)
+	for i := 0; i < s.maxWorkers; i++ {
+		go s.eventWorker(i, s.ctx.Done())
+	}
+
+}
+
+// OnConnectionEvent sends the details of a new connection throughout a channel,
+// in order to add the connection to the stats.
+func (s *Statistics) OnConnectionEvent(con *conman.Connection, match *rule.Rule, wasMissed bool) {
+	s.jobs <- conEvent{
+		con:       con,
+		match:     match,
+		wasMissed: wasMissed,
+	}
+	action := "<nil>"
+	rname := "<nil>"
+	if match != nil {
+		action = string(match.Action)
+		rname = string(match.Name)
+	}
+
+	s.logger.Log(con.Serialize(), action, rname)
 }
 
 // OnDNSResponse increases the counter of dns and accepted connections.
@@ -133,15 +177,19 @@ func (s *Statistics) incMap(m *map[string]uint64, key string) {
 	}
 }
 
-func (s *Statistics) eventWorker(id int) {
+func (s *Statistics) eventWorker(id int, done <-chan struct{}) {
 	log.Debug("Stats worker #%d started.", id)
 
 	for true {
 		select {
+		case <-done:
+			goto Exit
 		case job := <-s.jobs:
 			s.onConnection(job.con, job.match, job.wasMissed)
 		}
 	}
+Exit:
+	log.Debug("stats.worker() %d exited", id)
 }
 
 func (s *Statistics) onConnection(con *conman.Connection, match *rule.Rule, wasMissed bool) {
@@ -167,8 +215,8 @@ func (s *Statistics) onConnection(con *conman.Connection, match *rule.Rule, wasM
 	if con.DstHost != "" {
 		s.incMap(&s.ByHost, con.DstHost)
 	}
-	s.incMap(&s.ByPort, fmt.Sprintf("%d", con.DstPort))
-	s.incMap(&s.ByUID, fmt.Sprintf("%d", con.Entry.UserId))
+	s.incMap(&s.ByPort, strconv.FormatUint(uint64(con.DstPort), 10))
+	s.incMap(&s.ByUID, strconv.Itoa(con.Entry.UserId))
 	s.incMap(&s.ByExecutable, con.Process.Path)
 
 	// if we reached the limit, shift everything back
@@ -181,16 +229,8 @@ func (s *Statistics) onConnection(con *conman.Connection, match *rule.Rule, wasM
 		return
 	}
 	s.Events = append(s.Events, NewEvent(con, match))
-}
 
-// OnConnectionEvent sends the details of a new connection throughout a channel,
-// in order to add the connection to the stats.
-func (s *Statistics) OnConnectionEvent(con *conman.Connection, match *rule.Rule, wasMissed bool) {
-	s.jobs <- conEvent{
-		con:       con,
-		match:     match,
-		wasMissed: wasMissed,
-	}
+	s.newEvents = true
 }
 
 func (s *Statistics) serializeEvents() []*protocol.Event {
@@ -211,6 +251,7 @@ func (s *Statistics) emptyStats() {
 	if len(s.Events) > 0 {
 		s.Events = make([]*Event, 0)
 	}
+	s.newEvents = false
 	s.Unlock()
 }
 
@@ -221,6 +262,10 @@ func (s *Statistics) Serialize() *protocol.Statistics {
 	s.Lock()
 	defer s.emptyStats()
 	defer s.Unlock()
+
+	if !s.newEvents {
+		return nil
+	}
 
 	return &protocol.Statistics{
 		DaemonVersion: core.Version,

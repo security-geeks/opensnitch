@@ -9,6 +9,64 @@ service UI {
     rpc AskRule (Connection) returns (Rule) {}
     rpc Subscribe (ClientConfig) returns (ClientConfig) {}
     rpc Notifications (stream NotificationReply) returns (stream Notification) {}
+    rpc PostAlert(Alert) returns (MsgResponse) {}
+}
+
+/**
+  - Send error messages (kernel not compatible, etc)
+  - Send warnings (eBPF modules failed loading, etc)
+  - Send kernel events: new execs, bytes recv/sent, ...
+  - Alert of events defined by the user: alert when a rule matches
+*/
+message Alert {
+    enum Priority {
+        LOW = 0;
+        MEDIUM = 1;
+        HIGH = 2;
+    }
+    enum Type {
+        ERROR = 0;
+        WARNING = 1;
+        INFO = 2;
+    }
+    enum Action {
+        NONE = 0;
+        SHOW_ALERT = 1;
+        SAVE_TO_DB = 2;
+    }
+    // What caused the alert
+    enum What {
+        GENERIC = 0;
+        PROC_MONITOR = 1;
+        FIREWALL = 2;
+        CONNECTION = 3;
+        RULE = 4;
+        NETLINK = 5;
+        // bind, exec, etc
+        KERNEL_EVENT = 6;
+    }
+
+    uint64 id = 1;
+    Type type = 2;
+    // TODO: group of actions: SHOW_ALERT | SAVE_TO_DB
+    Action action = 3;
+    Priority priority = 4;
+    What what = 5;
+    // https://developers.google.com/protocol-buffers/docs/reference/go-generated#oneof
+    oneof data {
+        // errors, messages, etc
+        string text = 6;
+        // proc events: send/recv bytes, etc
+        Process proc = 8;
+        // conn events: bind, listen, etc
+        Connection conn = 9;
+        Rule rule = 10;
+        FwRule fwrule = 11;
+    }
+}
+
+message MsgResponse {
+    uint64 id = 1;
 }
 
 message Event {
@@ -47,6 +105,28 @@ message PingReply {
     uint64 id = 1;
 }
 
+message StringInt {
+    string key = 1;
+    uint32 value = 2;
+}
+
+message Process {
+    uint64 pid = 1;
+    uint64 ppid = 2;
+    uint64 uid = 3;
+    string comm = 4;
+    string path = 5;
+    repeated string args = 6;
+    map<string, string> env = 7;
+    string cwd = 8;
+    map<string, string> checksums = 9;
+    uint64 io_reads = 10;
+    uint64 io_writes = 11;
+    uint64 net_reads = 12;
+    uint64 net_writes = 13;
+    repeated StringInt process_tree = 14;
+}
+
 message Connection {
     string protocol = 1;
     string src_ip = 2;
@@ -60,6 +140,8 @@ message Connection {
     string process_cwd = 10;
     repeated string process_args = 11;
     map<string, string> process_env = 12;
+    map<string, string> process_checksums = 13;
+    repeated StringInt process_tree = 14;
 }
 
 message Operator {
@@ -67,30 +149,102 @@ message Operator {
     string operand = 2;
     string data = 3;
     bool sensitive = 4;
+    repeated Operator list = 5;
 }
 
 message Rule {
-    string name = 1;
-    bool enabled = 2;
-    bool precedence = 3;
-    string action = 4;
-    string duration = 5;
-    Operator operator = 6;
+    int64 created = 1;
+    string name = 2;
+    string description = 3;
+    bool enabled = 4;
+    bool precedence = 5;
+    bool nolog = 6;
+    string action = 7;
+    string duration = 8;
+    Operator operator = 9;
 }
 
+/* Action is the list of actions sent or received via the Notifications channel.
+ */
 enum Action {
     NONE = 0;
-    LOAD_FIREWALL = 1;
-    UNLOAD_FIREWALL = 2;
-    CHANGE_CONFIG = 3;
-    ENABLE_RULE = 4;
-    DISABLE_RULE = 5;
-    DELETE_RULE = 6;
-    CHANGE_RULE = 7;
-    LOG_LEVEL = 8;
-    STOP = 9;
-    MONITOR_PROCESS = 10;
-    STOP_MONITOR_PROCESS = 11;
+    ENABLE_INTERCEPTION = 1;
+    DISABLE_INTERCEPTION = 2;
+    ENABLE_FIREWALL = 3;
+    DISABLE_FIREWALL = 4;
+    RELOAD_FW_RULES = 5;
+    CHANGE_CONFIG = 6;
+    ENABLE_RULE = 7;
+    DISABLE_RULE = 8;
+    DELETE_RULE = 9;
+    CHANGE_RULE = 10;
+    LOG_LEVEL = 11;
+    STOP = 12;
+
+    /* Notifications of type TASK_START or TASK_STOP expect a JSON in the
+     * Notification.data field.
+     * It's parsed to a struct with format
+     * TaskNotification { Name string, Data interface{} }
+     * where Data is translated to a map of values (map[string]string), with
+     * the configuration for each task:
+     * PidMonitor: {"interval": "5s", "pid": "1234"}
+     * SocketsMonitor: {"interval": "5s", "states": "1,10"}
+     */
+    TASK_START = 13;
+    TASK_STOP = 14;
+}
+
+message StatementValues {
+    string Key = 1;
+    string Value = 2;
+}
+
+message Statement {
+    string Op = 1;
+    string Name = 2;
+    repeated StatementValues Values = 3;
+}
+
+message Expressions {
+    Statement Statement = 1;
+}
+
+message FwRule {
+    // DEPRECATED: for backward compatibility with iptables
+    string Table = 1;
+    string Chain = 2;
+
+    string UUID = 3;
+    bool Enabled = 4;
+    uint64 Position = 5;
+    string Description = 6;
+    string Parameters = 7;
+    repeated Expressions Expressions = 8;
+    string Target = 9;
+    string TargetParameters = 10;
+}
+
+message FwChain {
+    string Name = 1;
+    string Table = 2;
+    string Family = 3;
+    string Priority = 4;
+    string Type = 5;
+    string Hook = 6;
+    string Policy = 7;
+    repeated FwRule Rules = 8;
+}
+
+message FwChains {
+    // DEPRECATED: backward compatibility with iptables
+    FwRule Rule = 1;
+    repeated FwChain Chains = 2;
+}
+
+message SysFirewall {
+    bool Enabled = 1;
+    uint32 Version = 2;
+    repeated FwChains SystemRules = 3;
 }
 
 // client configuration sent on Subscribe()
@@ -103,9 +257,19 @@ message ClientConfig {
     string config = 5;
     uint32 logLevel = 6;
     repeated Rule rules = 7;
+    SysFirewall systemFirewall = 8;
 }
 
-// notification sent to the clients (daemons)
+/* Notification message is sent to the clients (daemons) from the GUI (server)
+ * for several purposes:
+ *  - Start tasks.
+ *  - Change configurations (rules, firewall, configuration)
+ *  - Start / Stop interception or firewall.
+ *  - Sent back the status of each task (errors, ok)
+ *
+ * Notifications are sent via an always open streaming channel.
+ * It's also used indirectly to maintain the connection status with the GUI (server).
+ */
 message Notification {
     uint64 id = 1;
     string clientName = 2;
@@ -114,6 +278,7 @@ message Notification {
     Action type = 4;
     string data = 5;   
     repeated Rule rules = 6;
+    SysFirewall sysFirewall = 7;
 }
 
 // notification reply sent to the server (GUI)

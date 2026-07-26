@@ -1,0 +1,1242 @@
+import math
+import threading
+
+from PyQt6.QtGui import QStandardItemModel
+from PyQt6.QtSql import QSqlQuery, QSql
+from PyQt6.QtWidgets import QTableView
+from PyQt6.QtCore import (
+    QItemSelectionRange,
+    QItemSelectionModel,
+    QItemSelection,
+    QModelIndex,
+    QObject,
+    pyqtSignal,
+    QEvent,
+    Qt)
+
+class GenericTableModel(QStandardItemModel):
+    rowCountChanged = pyqtSignal()
+    beginViewPortRefresh = pyqtSignal()
+    endViewPortRefresh = pyqtSignal()
+
+    db = None
+    tableName = ""
+    # total row count which must de displayed in the view
+    totalRowCount = 0
+    #
+    lastColumnCount = 0
+
+    queryLimit = 0
+    queryOffset = 0
+
+    # original query string before we modify it
+    origQueryStr = ""
+    # previous original query string; used to check if the query has changed
+    prevQueryStr = ''
+    # modified query object
+    realQuery = QSqlQuery()
+
+    items = []
+    lastItems = []
+
+    def __init__(self, tableName, headerLabels):
+        self.tableName = tableName
+        self.headerLabels = headerLabels
+        self.lastColumnCount = len(self.headerLabels)
+        QStandardItemModel.__init__(self, 0, self.lastColumnCount)
+        self.setHorizontalHeaderLabels(self.headerLabels)
+
+    def headers(self):
+        return self.headerLabels
+
+    def getLimitQuery(self, offset, forward=True):
+        if "LIMIT" not in self.origQueryStr:
+            self.origQueryStr += f" LIMIT {self.queryLimit} OFFSET {self.queryOffset}"
+
+        parts = self.origQueryStr.split("LIMIT")
+        qstr = parts[0].strip()
+        limit = parts[1].strip()
+        parts = limit.split(" ")
+        limit_n = int(parts[0])
+
+        qstr = f"{qstr} LIMIT {limit_n}"
+
+        if "OFFSET" in parts:
+            if forward:
+                offset = int(parts[2]) + offset
+            else:
+                offset = int(parts[2]) - offset
+                offset = max(offset, 0)
+        qstr = f"{qstr} OFFSET {offset}"
+
+        return qstr, limit_n
+
+    #Some QSqlQueryModel methods must be mimiced so that this class can serve as a drop-in replacement
+    #mimic QSqlQueryModel.query()
+    def query(self):
+        return self
+
+    #mimic QSqlQueryModel.query().lastQuery()
+    def lastQuery(self):
+        return self.origQueryStr
+
+    #mimic QSqlQueryModel.query().lastError()
+    def lastError(self):
+        return self.realQuery.lastError()
+
+    #mimic QSqlQueryModel.clear()
+    def clear(self):
+        pass
+
+    def refresh(self):
+        self.realQuery.exec()
+        self.update_row_count()
+        self.update_col_count()
+
+    def rowCount(self, index=None):
+        """ensures that only the needed rows is created"""
+        return len(self.items)
+
+    def total(self):
+        q = QSqlQuery(self.db)
+        q.exec(f"SELECT count(rowid) FROM {self.tableName}")
+        q.next()
+        num = q.value(0)
+        if num is None:
+            return 0
+        return num
+
+    def suspend(self):
+        """Release the result set when this tab is not visible."""
+        self.realQuery.finish()
+        #self.realQuery.clear()
+        self.items = []
+        self.lastItems = []
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        """Paint rows with the data stored in self.items
+        """
+        if role == Qt.ItemDataRole.DisplayRole or role == Qt.ItemDataRole.EditRole:
+            items_count = len(self.items)
+            if index.isValid() and items_count > 0 and index.row() < items_count:
+                return self.items[index.row()][index.column()]
+        return QStandardItemModel.data(self, index, role)
+
+    def update_row_count(self):
+        queryRows = max(0, self.realQuery.at()+1)
+
+        # Ensure that we correctly configure max number of rows.
+        # This scenario can occur when selecting rows in a view, switch to
+        # another view and return back to the previous view.
+        # XXX: using queryLimit is not entirely correct, we should verify that
+        # the query returns the number of results that it's supposed to return.
+        if queryRows > self.queryLimit and self.queryLimit != 0:
+            self.totalRowCount = self.queryLimit
+        else:
+            self.totalRowCount = queryRows
+        self.setRowCount(self.totalRowCount)
+
+    def update_col_count(self):
+      # update view's columns
+        queryColumns = self.realQuery.record().count()
+        if queryColumns != self.lastColumnCount:
+            self.setModelColumns(queryColumns)
+
+    # set columns based on query's fields
+    def setModelColumns(self, newColumns):
+        # Avoid firing signals while reconfiguring the view, it causes
+        # segfaults.
+        self.blockSignals(True);
+
+        self.headerLabels = []
+        self.removeColumns(0, self.lastColumnCount)
+        self.setHorizontalHeaderLabels(self.headerLabels)
+        for col in range(0, newColumns):
+            self.headerLabels.append(self.realQuery.record().fieldName(col))
+        self.lastColumnCount = newColumns
+        self.setHorizontalHeaderLabels(self.headerLabels)
+        self.setColumnCount(len(self.headerLabels))
+
+        self.blockSignals(False);
+
+    def setQuery(self, q, db, binds=None, limit=None, offset=None):
+        tmpQuery = self.realQuery
+        if self.prevQueryStr != q:
+            tmpQuery = QSqlQuery(q, db)
+
+        if binds is not None:
+            tmpQuery.prepare(q)
+            for idx, v in binds:
+                tmpQuery.bindValue(idx, v)
+
+        ok = tmpQuery.exec()
+        if not ok:
+            return
+        # this call is mandatory, the query must be positioned on a valid
+        # record. Otherwise it'll segfault or won't display any data.
+        tmpQuery.last()
+
+        if offset is not None:
+            self.queryOffset = offset
+        if limit is not None:
+            self.queryLimit = limit
+        self.origQueryStr = q
+        self.db = db
+
+        if self.prevQueryStr != self.origQueryStr:
+            self.realQuery = tmpQuery
+
+        self.update_row_count()
+        self.update_col_count()
+
+        self.prevQueryStr = self.origQueryStr
+        self.rowCountChanged.emit()
+
+    def nextRecord(self, offset):
+        qstr, self.queryLimit = self.getLimitQuery(offset, forward=True)
+        if qstr is not None:
+            self.queryOffset += self.queryLimit
+            self.setQuery(qstr, self.db, limit=self.queryLimit, offset=self.queryOffset)
+            return self.queryLimit, self.queryOffset
+
+        return offset, 0
+
+    def prevRecord(self, offset):
+        qstr, self.queryLimit = self.getLimitQuery(offset, forward=False)
+        if qstr is not None:
+            self.queryOffset = max(0, self.queryOffset - self.queryLimit)
+            self.setQuery(qstr, self.db, limit=self.queryLimit, offset=self.queryOffset)
+            return self.queryLimit, self.queryOffset
+
+        return offset, 0
+
+    def refreshViewport(self, scrollValue, maxRowsInViewport, force=False):
+        """Refresh the viewport with data from the db.
+        Before making any changes, emit a signal which will perform several operations
+        (save current selected row, etc).
+        force var will force a refresh if the scrollbar is at the top or bottom of the
+        viewport, otherwise skip it to allow rows analyzing without refreshing.
+        """
+        if not force:
+            return
+
+        self.beginViewPortRefresh.emit()
+        # set records position to last, in order to get correctly the number of
+        # rows.
+        self.realQuery.last()
+        at = self.realQuery.at()
+        rowsFound = max(0, self.queryOffset+at+1)
+        if scrollValue == 0 or self.realQuery.at() == QSql.Location.BeforeFirstRow.value:
+            self.realQuery.seek(QSql.Location.BeforeFirstRow.value)
+        elif at == QSql.Location.AfterLastRow.value:
+            self.realQuery.seek(QSql.Location.BeforeFirstRow.value)
+            self.realQuery.seek(rowsFound - maxRowsInViewport)
+        else:
+            self.realQuery.seek(min(scrollValue-1, at))
+
+        upperBound = min(maxRowsInViewport, rowsFound)
+
+        # only visible rows will be filled with data, and only if we're not
+        # updating the viewport already.
+        if force and (upperBound > 0 or at < 0):
+            self.fillVisibleRows(self.realQuery, upperBound, force)
+        self.endViewPortRefresh.emit()
+
+    def fillVisibleRows(self, q, upperBound, force=False):
+        rowsLabels = []
+
+        self.items = []
+        cols = []
+        header_count = self.columnCount()
+        #don't trigger setItem's signals for each cell, instead emit dataChanged for all cells
+        offidx = self.queryOffset
+        for x in range(0, upperBound):
+            if not q.next():
+                break
+            if q.at() < 0:
+                # if we don't set query to a valid record here, it gets stucked
+                # forever at -2/-1.
+                q.seek(upperBound)
+                break
+            rowsLabels.append(str(offidx+q.at()+1))
+            cols = []
+            for col in range(0, header_count):
+                val = q.value(col)
+                if val is None:
+                    val = ""
+                cols.append(str(val))
+
+            self.items.append(cols)
+
+        # we need to set the row count here, otherwise the GUI may crash in
+        # some systems.
+        # we also need to update these two values in order to update the row
+        # numbers correctly.
+        self.setRowCount(len(rowsLabels))
+        self.setVerticalHeaderLabels(rowsLabels)
+
+        if self.lastItems != self.items or force is True:
+            self.dataChanged.emit(self.createIndex(0,0), self.createIndex(upperBound, header_count))
+        self.lastItems = self.items
+        del cols
+
+    def dumpRows(self, nolimits=False, first_row=QSql.Location.BeforeFirstRow.value, last_row=QSql.Location.AfterLastRow.value):
+        if first_row is None or last_row is None:
+            return
+        rows = []
+        qstr = self.origQueryStr
+        if first_row == last_row:
+            last_row += 1
+        if nolimits:
+            qstr = self.origQueryStr.split("LIMIT")[0]
+            self.realQuery.exec(qstr)
+        # reset records position, in order to get correctly the number of
+        # rows.
+        self.realQuery.first()
+        self.realQuery.seek(first_row)
+        header_count = self.columnCount()
+        while self.realQuery.next():
+            if self.realQuery.at() == last_row:
+                break
+            row = []
+            for col in range(0, header_count):
+                row.append(self.realQuery.value(col))
+            rows.append(row)
+        return rows
+
+    def copySelectedRows(self, start=QSql.Location.BeforeFirstRow.value, end=QSql.Location.AfterLastRow.value):
+        rows = []
+        lastAt = self.realQuery.at()
+        self.realQuery.seek(start)
+        header_count = self.columnCount()
+        while self.realQuery.next():
+            if self.realQuery.at() == QSql.Location.AfterLastRow.value or len(rows) >= end:
+                break
+            row = []
+            for col in range(0, header_count):
+                row.append(self.realQuery.value(col))
+            rows.append(row)
+        self.realQuery.seek(lastAt)
+        return rows
+
+class GenericTableView(QTableView):
+    vScrollBar = None
+
+    class Signals(QObject):
+        paginateEvent = pyqtSignal(int, int)
+
+    def __init__(self, parent):
+        QTableView.__init__(self, parent)
+        self._lock = threading.RLock()
+
+        self.signals = self.Signals()
+
+        # how many rows can potentially be displayed in viewport.
+        # the actual number of rows currently displayed may be less than this
+        self.maxRowsInViewport = 0
+        self.mousePressed = False
+        self.shiftPressed = False
+        self.ctrlPressed = False
+        self.keySelectAll = False
+        self.trackingCol = 0
+
+        # current selected rows
+        self._rows_selection = set()
+
+        # selection range to highlight the rows of the viewport, that is,
+        # the rows of the current sql query (offset + limit).
+        self._first_row_selected = None
+        self._last_row_selected = None
+        # selection range that will be used to retrieve from the db the rows
+        # selected by the user.
+        # this range takes into account the current offset of the sql query, in
+        # order to select the real row.
+        self._db_selection_range = {
+            'first': None,
+            'last': None
+        }
+
+        # flag to avoid excessive refreshes
+        self._last_height = 0
+
+        self.verticalHeader().setVisible(True)
+        self.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.horizontalHeader().setStretchLastSection(True)
+        # the built-in vertical scrollBar of this view is always off
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # eventFilter to catch key up/down events and wheel events
+        self.installEventFilter(self)
+
+    def setVerticalScrollBar(self, vScrollBar):
+        self.vScrollBar = vScrollBar
+        self.vScrollBar.valueChanged.connect(self.onScrollbarValueChanged)
+        self.vScrollBar.setVisible(False)
+
+    def setModel(self, model):
+        super().setModel(model)
+        model.rowCountChanged.connect(self.onRowCountChanged)
+        model.beginViewPortRefresh.connect(self.onBeginViewportRefresh)
+        model.endViewPortRefresh.connect(self.onEndViewportRefresh)
+
+    # FIXME: some columns may have the same value on different nodes
+    # like rule name zzz on nodes 1, 2 and 3.
+    def setTrackingColumn(self, col):
+        """column used to track a selected row while scrolling on this table"""
+        self.trackingCol = col
+
+    def selectAll(self):
+        super().selectAll()
+        self.keySelectAll = True
+        self.selectDbRows(QSql.Location.BeforeFirstRow.value, QSql.Location.AfterLastRow.value)
+
+    def getRowCells(self, row):
+        cols = []
+        for i in range(0, self.model().columnCount()):
+            c = self.model().index(row, i)
+            cols.append(c.data())
+        return cols
+
+    def selectDbRows(self, first, last):
+        """get rows range from the db"""
+        # dumpRows() already take into account the OFFSET, so first and last must
+        # be relative.
+        offset = self.model().queryOffset
+        limit = self.model().queryLimit
+        selrows = self.model().dumpRows(nolimits=True, first_row=first, last_row=last)
+        if selrows is None:
+            return
+        self._rows_selection.clear()
+        for rid, row in enumerate(selrows):
+            key = row[self.trackingCol]
+            self._rows_selection.add(key)
+        self.selectIndices()
+
+    def getMinViewportRow(self):
+        """get the first row of the viewport. Starts from 1"""
+        return self.vScrollBar.value()+1
+
+    def getMaxViewportRow(self):
+        """get the total rows relative to the viewport"""
+        return self.vScrollBar.value() + self.maxRowsInViewport
+
+    def getViewportRowPos(self, row):
+        """get the row position relative to the viewport"""
+        return self.getMinViewportRow() + row
+
+    def clear(self):
+        self.keySelectAll = False
+
+    def refresh(self):
+        self.calculateRowsInViewport()
+        self.model().setRowCount(min(self.maxRowsInViewport, self.model().totalRowCount))
+        self.model().refreshViewport(self.vScrollBar.value(), self.maxRowsInViewport, force=True)
+        # Note: on PyQt6 we need to update the viewport explicitely.
+        self.viewport().update()
+
+    def forceViewRefresh(self):
+        return (self.vScrollBar.minimum() == self.vScrollBar.value() or self.vScrollBar.maximum() == self.vScrollBar.value())
+
+    def calculateRowsInViewport(self):
+        rowHeight = self.verticalHeader().defaultSectionSize()
+        # we don't want partial-height rows in viewport, hence .floor()
+        self.maxRowsInViewport = math.floor(self.viewport().height() / rowHeight)
+
+    def scrollViewport(self, row):
+        maxVal = self.maxRowsInViewport-1
+        if row >= maxVal:
+            pos = self.vScrollBar.value() + 1
+            self.vScrollBar.setValue(pos)
+            return pos
+        elif row == 0:
+            pos = max(0, self.vScrollBar.value() - 1)
+            self.vScrollBar.setValue(pos)
+            return pos
+
+        return None
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        self.mousePressed = False
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = event.pos()
+        row = self.rowAt(pos.y())
+        viewport_row = self.getViewportRowPos(row)
+        offset = self.model().queryOffset
+
+        # when the mouse goes off the viewport while dragging, row is -1.
+        # in this scenario, set a valid last row.
+        if self._last_row_selected is None and (row == -1 and viewport_row == 0):
+            self._last_row_selected = self._first_row_selected
+            self._first_row_selected = 0
+            self._db_selection_range['last'] = self._db_selection_range['first']
+            self._db_selection_range['first'] = 0
+        elif self._last_row_selected is None and (row == -1 and viewport_row+self.maxRowsInViewport == self.getMaxViewportRow()):
+            self._last_row_selected = self.getMaxViewportRow()+1
+
+        if self._first_row_selected is None:
+            self._first_row_selected = viewport_row
+            self._db_selection_range['first'] = viewport_row + offset
+        if self._last_row_selected is None:
+            self._last_row_selected = viewport_row
+            self._db_selection_range['last'] = viewport_row + offset
+
+        sel_direction = 0
+        # invert the selection after moving up
+        if self._first_row_selected > self._last_row_selected:
+            sel_direction = 1
+            last = self._first_row_selected
+            first = self._last_row_selected
+            self._last_row_selected = last
+            self._first_row_selected = first
+            last = self._db_selection_range['first']
+            first = self._db_selection_range['last']
+            self._db_selection_range['first'] = first
+            self._db_selection_range['last'] = last
+
+        if self.shiftPressed:
+            self.handleShiftPressed()
+            return
+
+        if self._first_row_selected == self._last_row_selected:
+            return
+
+        if self.ctrlPressed:
+            return
+
+        selected = self.selectionModel().selectedRows()
+        self.selectDbRows(self._db_selection_range['first']-2, self._db_selection_range['last'])
+        # place the "cursor" (current index) at the start or end of the selected range.
+        # the keyboard will use it to advance from that row onward.
+        if len(selected) == 0:
+            return
+
+        last_idx = selected[-1]
+        if sel_direction == 1:
+            last_idx = selected[0]
+        self.selectionModel().setCurrentIndex(
+            last_idx,
+            QItemSelectionModel.SelectionFlag.Rows | QItemSelectionModel.SelectionFlag.NoUpdate
+        )
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        pos = event.pos()
+        row = self.rowAt(pos.y())
+        item = self.indexAt(pos)
+
+        if item is None:
+            return
+
+        clickedItem = self.model().index(row, self.trackingCol)
+        if clickedItem.data() is None:
+            return
+        self.handleMouseMoveEvent(row, clickedItem, self.selectionModel().isRowSelected(row, QModelIndex()))
+
+    # save the selected index, to preserve selection when moving around.
+    def mousePressEvent(self, event):
+        # we need to call upper class to paint selections properly
+        super().mousePressEvent(event)
+        self.mousePressed = True
+        rightBtnPressed = event.button() != Qt.MouseButton.LeftButton
+
+        self.keySelectAll = False
+
+        pos = event.pos()
+        item = self.indexAt(pos)
+        row = self.rowAt(pos.y())
+        if item is None:
+            return
+
+        # FIXME: one column is not enough to uniquely identify rows.
+        # for example, we may have the same rule on different nodes, but we'll
+        # still use only the name of the rule, so we end up selecting multiple
+        # rows.
+        clickedItem = self.model().index(row, self.trackingCol)
+        if clickedItem.data() is None:
+            return
+
+        flags = QItemSelectionModel.SelectionFlag.Rows | QItemSelectionModel.SelectionFlag.SelectCurrent
+
+        # 1. if ctrl is pressed, select / deselect current row
+        # 2. if shift is pressed, select the first and last row of the range.
+        #    The selection will be selected on mouseReleaseEvent() ->
+        #    handleShiftPressed() -> selectIndidces()
+        # 3. if ctrl and shift is not pressed:
+        #   1. discard previous selection
+        #   2. select current line if it's not selected. Deselect it otherwise.
+        # 4. if ctrl is not pressed and there's more than one row selected, and
+        # the clicked row is selected: discard selection, and select current
+        # clicked row.
+        # 5. if Left button has not been pressed, do not discard the selection.
+        rowSelected = clickedItem.data() in self._rows_selection
+        if rowSelected and rightBtnPressed:
+            return
+
+        offset = self.model().queryOffset
+        viewport_row = self.getViewportRowPos(row)
+        if self._first_row_selected is None:
+            self._first_row_selected = viewport_row
+            self._db_selection_range['first'] = viewport_row + offset
+        if self._last_row_selected is None:
+            self._last_row_selected = viewport_row
+            self._db_selection_range['last'] = viewport_row + offset
+
+        if self.ctrlPressed:
+            if rowSelected:
+                self._rows_selection.remove(clickedItem.data())
+                flags = QItemSelectionModel.SelectionFlag.Rows | QItemSelectionModel.SelectionFlag.Deselect
+                if self.ctrlPressed:
+                    self._first_row_selected = None
+                    self._db_selection_range['first'] = None
+            else:
+                self._rows_selection.add(clickedItem.data())
+        elif self.shiftPressed:
+            if self._last_row_selected is None:
+                self._last_row_selected = viewport_row
+                self._db_selection_range['last'] = viewport_row + offset
+
+            # update the first or last row depending on the direction the row
+            # has been selected.
+            if viewport_row < self._first_row_selected:
+                self._first_row_selected = viewport_row
+            if viewport_row > self._last_row_selected:
+                self._last_row_selected = viewport_row
+
+            if viewport_row+offset < self._db_selection_range['first']:
+                self._db_selection_range['first'] = viewport_row + offset
+            if viewport_row+offset > self._db_selection_range['first']:
+                self._db_selection_range['last'] = viewport_row + offset
+        else:
+            deselectCurRow = len(self._rows_selection) == 1 and not rightBtnPressed
+            # discard current selection:
+            # - if the user right clicked on a row not part of a selection.
+            # - if the user clicked on a row, and there's only one row
+            # selected.
+            # - if the user clicked on a row already selected.
+            if (not rowSelected and rightBtnPressed) or not rightBtnPressed or deselectCurRow:
+                self.clearSelection()
+                self._first_row_selected = viewport_row
+                self._db_selection_range['first'] = viewport_row + offset
+            if rowSelected and deselectCurRow and not rightBtnPressed:
+                self._first_row_selected = None
+                self._db_selection_range['first'] = None
+                flags = QItemSelectionModel.SelectionFlag.Rows | QItemSelectionModel.SelectionFlag.Deselect
+            else:
+                self._rows_selection.add(clickedItem.data())
+
+        if self._db_selection_range['last'] is None:
+            self._db_selection_range['last'] = self._db_selection_range['first']
+        if self._last_row_selected is None:
+            self._last_row_selected = self._first_row_selected
+
+        self.selectionModel().setCurrentIndex(
+            clickedItem,
+            flags
+        )
+
+    def handleShiftPressed(self):
+        # in the viewport, the rows start at 1, but in the db at 0
+        self.selectDbRows(self._db_selection_range['first']-2, self._db_selection_range['last'])
+
+    def handleMouseMoveEvent(self, row, clickedItem, selected):
+        # this code serves to highlight rows while selecting rows by dragging
+        # the mouse.
+        if not selected:
+            if clickedItem.data() in self._rows_selection:
+                self._rows_selection.remove(clickedItem.data())
+        else:
+            self._rows_selection.add(clickedItem.data())
+
+        offset = self.model().queryOffset
+        self._last_row_selected = self.getViewportRowPos(row)
+        self._db_selection_range['last'] = self._last_row_selected + offset
+        # handle scrolling the view while dragging the mouse.
+        self.scrollViewport(row)
+
+    def onBeginViewportRefresh(self):
+        # if the selected row due to scrolling up/down doesn't match with the
+        # saved index, deselect the row, because the saved index is out of the
+        # view.
+        pass
+
+    def onEndViewportRefresh(self):
+        with self._lock:
+            if not self.mousePressed and not self.shiftPressed and not self.keySelectAll:
+                self.selectionModel().clear()
+            if self.keySelectAll:
+                self.selectDbRows(QSql.Location.BeforeFirstRow.value, QSql.Location.AfterLastRow.value)
+            else:
+                self.selectIndices()
+            self.viewport().update()
+
+    def resizeEvent(self, event):
+        super(GenericTableView, self).resizeEvent(event)
+        # refresh the viewport data based on new geometry.
+        # If the height has not changed, we don't need to refresh the view.
+        if self._last_height != self.verticalHeader().height():
+            self._last_height = self.verticalHeader().height()
+            self.refresh()
+
+    def onRowCountChanged(self):
+        totalCount = self.model().totalRowCount
+        offset = self.model().queryOffset
+        limit = self.model().queryLimit
+        lastMax = self.vScrollBar.maximum()
+        vmax = max(0, totalCount - self.maxRowsInViewport+1)
+        if totalCount < self.maxRowsInViewport and offset > 0:
+            vmax = self.maxRowsInViewport-5
+        showScroll = False
+        # we don't need to show the scrollbar if all the items fit in the
+        # viewport.
+        # However, if the user paginated the view and the last items fit in the
+        # viewport, we still need to show the scrollbar to allow go back to the
+        # previous view.
+        if totalCount > self.maxRowsInViewport or (totalCount < self.maxRowsInViewport and offset > 0):
+            showScroll = True
+        self.vScrollBar.setVisible(showScroll)
+
+        # we need to decide if the viewport needs to be refreshed, before
+        # setting the min and max scrollbar values.
+        doRefresh=self.forceViewRefresh()
+        self.vScrollBar.setMinimum(0)
+        # one scrollbar step is one row
+        self.vScrollBar.setMaximum(vmax)
+
+        scrollVal = self.vScrollBar.value()
+        # if latest max scrollbar value is less than current vmax, we're going
+        # from latest results to previous batch of results.
+        # in order to paint the new results correctly, use vmax as current
+        # scrollbar position.
+        if lastMax < vmax:
+            scrollVal = vmax
+
+        self.signals.paginateEvent.emit(offset, limit)
+        self.model().refreshViewport(scrollVal, self.maxRowsInViewport, force=doRefresh)
+
+    def clearSelection(self):
+        self.keySelectAll = False
+        self.shiftPressed = False
+        self.ctrlPressed = False
+        self.selectionModel().clear()
+        self.selectionModel().reset()
+        self.selectionModel().clearCurrentIndex()
+        self._rows_selection.clear()
+        self._first_row_selected = None
+        self._last_row_selected = None
+        self._db_selection_range = {
+            'first': None,
+            'last': None
+        }
+
+    def selectedRows(self, limit=""):
+        if self.keySelectAll:
+            return self.model().dumpRows(nolimits=True)
+        if len(self._rows_selection) == 0:
+            return
+
+        # viewport_rows contains all the rows of the current query, regardless if
+        # they're displayed in the view or not.
+        # FIXME: if we're off the first limit of results, we need to dump all the
+        # results.
+        offset = self.model().queryOffset
+        viewport_rows = self.model().dumpRows(nolimits=offset > 0 or self._db_selection_range['first'] > offset)
+        if viewport_rows is None:
+            return
+        rows = []
+        selected = []
+        for row in viewport_rows:
+            cell = row[self.trackingCol]
+            if cell not in self._rows_selection or cell in selected:
+                continue
+            selected.append(cell)
+            rows.append(row)
+        viewport_rows = None
+        selected = None
+        return rows
+
+    def getCurrentIndex(self):
+        return self.selectionModel().currentIndex().internalId()
+
+    def selectItem(self, _data, _column):
+        """Select a row based on the data displayed on the given column.
+        """
+        if _data == "":
+            return
+        items = self.model().findItems(_data, column=_column)
+        if len(items) == 0:
+            return
+
+        self.selectionModel().setCurrentIndex(
+            items[0].index(),
+            QItemSelectionModel.SelectionFlag.Rows | QItemSelectionModel.SelectionFlag.SelectCurrent
+        )
+
+    def selectIndices(self):
+        sel = QItemSelection()
+
+        # XXX: a key can be duplicated. For example rule with the same name on
+        # different nodes.
+        for text in self._rows_selection:
+            items = self.model().findItems(text, column=self.trackingCol)
+            if len(items) == 0:
+                continue
+
+            for i in items:
+                sel.append(QItemSelectionRange(i.index()))
+        self.selectionModel().select(
+            sel,
+            QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        )
+
+    def _selectLastRow(self):
+        # BUG: Depending on the viewport state, latest row may be invalid:
+        # "Cannot create accessible child interface for object:"
+        idx = None
+        rows = self.maxRowsInViewport
+        # if there're more rows that the viewport can display, use
+        # maxRowsInViewport as the last row. Otherwise use last dispayed row.
+        if self.model().totalRowCount < self.maxRowsInViewport:
+            rows = self.model().totalRowCount
+
+        # find last valid model index.
+        for i in reversed(range(0, rows)):
+            new_idx = self.model().index(i, self.trackingCol)
+            if new_idx.row() != -1:
+                idx = new_idx
+                break
+
+        if idx is None:
+            idx = self.model().createIndex(self.maxRowsInViewport-1, self.trackingCol, 0)
+        self.selectionModel().setCurrentIndex(
+            idx,
+            QItemSelectionModel.SelectionFlag.Rows | QItemSelectionModel.SelectionFlag.SelectCurrent
+        )
+
+    def _deselectRow(self, pos):
+        internalId = self.getCurrentIndex()
+        idx = self.model().index(pos, self.trackingCol)
+        if idx.row() == -1:
+            idx = self.model().createIndex(pos, self.trackingCol, internalId)
+        self.selectionModel().setCurrentIndex(
+            idx,
+            QItemSelectionModel.SelectionFlag.Rows | QItemSelectionModel.SelectionFlag.Clear
+        )
+
+    def _toggleRow(self, pos):
+        internalId = self.getCurrentIndex()
+        idx = self.model().index(pos, self.trackingCol)
+        if idx.row() == -1:
+            # FIXME:
+            # "Cannot create accessible child interface" error on key down +
+            # last viewport row.
+            if pos == self.maxRowsInViewport:
+                pos -= 1
+            idx = self.model().createIndex(pos, self.trackingCol, internalId)
+        self.selectionModel().setCurrentIndex(
+            idx,
+            QItemSelectionModel.SelectionFlag.Rows | QItemSelectionModel.SelectionFlag.ToggleCurrent
+        )
+
+
+    def _selectRow(self, pos):
+        internalId = self.getCurrentIndex()
+        idx = self.model().index(pos, self.trackingCol)
+        if idx.row() == -1:
+            # FIXME:
+            # "Cannot create accessible child interface" error on key down +
+            # last viewport row.
+            if pos == self.maxRowsInViewport:
+                pos -= 1
+            idx = self.model().createIndex(pos, self.trackingCol, internalId)
+        self.selectionModel().setCurrentIndex(
+            idx,
+            QItemSelectionModel.SelectionFlag.Rows | QItemSelectionModel.SelectionFlag.SelectCurrent
+        )
+
+    def onScrollbarValueChanged(self, vSBNewValue):
+        totalRows = self.model().totalRowCount
+        offset = self.model().queryOffset
+        limit = self.model().queryLimit
+        if vSBNewValue == self.vScrollBar.maximum() and totalRows == limit:
+            self.vScrollBar.blockSignals(True)
+            # position the scrollbar before querying the db, and avoid firing
+            # an onScrollbarValueChanged event.
+            self.vScrollBar.setValue(0)
+            self.vScrollBar.blockSignals(False)
+            self.model().nextRecord(limit)
+        elif vSBNewValue == 0 and offset != 0:
+            # fake the position of the scrollbar before running the query,
+            # in order to obtain the results correctly. Otherwise the scrollbar
+            # is positioned at position 0, and the first results of the query
+            # are painted instead of latest ones.
+            self.vScrollBar.blockSignals(True)
+            self.vScrollBar.setValue(self.vScrollBar.maximum())
+            self.vScrollBar.blockSignals(False)
+            self.model().prevRecord(limit)
+            # the scrollbar in this case must be positioned after the query,
+            # in order to override it.
+            self.vScrollBar.blockSignals(True)
+            self.vScrollBar.setValue(self.vScrollBar.maximum()-1)
+            self.vScrollBar.blockSignals(False)
+        else:
+            self.model().refreshViewport(vSBNewValue, self.maxRowsInViewport, force=True)
+
+    def onKeyUp(self):
+        prevIdx = self.selectionModel().currentIndex()
+        curRow = prevIdx.row()
+        if curRow >= 0:
+            curRow -= 1
+        curIdx = self.model().index(curRow, self.trackingCol)
+        curData = curIdx.data()
+        prevData = prevIdx.data()
+        viewport_row = self.getViewportRowPos(curRow)
+        offset = self.model().queryOffset
+        limit = self.model().queryLimit
+        if not self.shiftPressed and not self.ctrlPressed and not self.keySelectAll:
+            # clean any selections
+            self.selectionModel().clear()
+            self._rows_selection.clear()
+
+            self._first_row_selected = viewport_row
+            self._last_row_selected = self._first_row_selected
+            self._db_selection_range['last'] = viewport_row + offset
+            self._db_selection_range['first'] = self._db_selection_range['last']
+        self._db_selection_range['first'] = viewport_row + offset
+        self._first_row_selected = viewport_row
+
+        toggle = True
+        # handle last/previous selected row to expand/shrink selection range:
+        if prevData is not None and prevData in self._rows_selection:
+            # if no key modifiers are pressed, just deselect the row.
+            if not self.shiftPressed and not self.ctrlPressed:
+                self._deselectRow(prevIdx.row())
+                self._rows_selection.remove(prevData)
+            else:
+                # if shift or ctrl is pressed and previous row is selected, deselect it.
+                if self.selectionModel().isSelected(prevIdx) and self.selectionModel().isSelected(curIdx):
+                    self._deselectRow(prevIdx.row())
+                    self._rows_selection.remove(prevData)
+
+        if curData is not None:
+            # handle row selection range expansion/shrinkage
+            # if row is selected, toggle current row and remove latest row from
+            # the selected rows.
+            if curData in self._rows_selection:
+                self._toggleRow(curIdx.row())
+                toggle = False
+            else:
+                self._rows_selection.add(curData)
+        self._last_row_selected = viewport_row
+        if self._first_row_selected is None:
+            self._first_row_selected = viewport_row
+
+        if self.shiftPressed or self.ctrlPressed:
+            self.selectIndices()
+        if toggle:
+            self._toggleRow(curRow)
+
+        # if the movement is between the view limits, is all done, exit.
+        if curRow >= 0:
+            return
+
+        # if the selection goes out the view, we need to fetch the previous batch of
+        # results. After the pagination event, the row numbers and indices will
+        # be different, so we need to obtain it again.
+
+        # force a pagination event if there're more results to fetch.
+        if self.vScrollBar.value() == 1 and offset > 0:
+            # handle scenario when the selected row is about to be 0:
+            # when a scrollbar event is triggered, if the scrollbar position is 0 and
+            # offset > 0, we'll fetch previous batch of results.
+            # In order to avoid jumping from row 1 to previous offset, we need
+            # to manually set scrollbar to position 0 and refresh the viewport.
+            self.vScrollBar.blockSignals(True)
+            self.vScrollBar.setValue(self.vScrollBar.value()-1)
+            self.vScrollBar.blockSignals(False)
+            self.model().refreshViewport(0, self.maxRowsInViewport, force=True)
+            self._selectRow(0)
+        else:
+            if self.vScrollBar.value() == 0 and offset > 0:
+                # when the scrollbar is at position 0, it can't be moved
+                # further, so we need to manually set to 1 in order to trigger
+                # a scroll event.
+                self.vScrollBar.setValue(self.vScrollBar.value()+1)
+            self.vScrollBar.setValue(self.vScrollBar.value()-1)
+            self.selectionModel().clear()
+
+            if viewport_row <= 1 and offset > 0:
+                self._selectLastRow()
+
+            # force selecting the first row if current row is the first row of the table.
+            elif curRow == -1 and offset >= 0:
+                self._selectRow(0)
+
+        curIdx = self.selectionModel().currentIndex()
+        if self.shiftPressed or self.ctrlPressed:
+            if curIdx.data() is not None and curIdx.data() not in self._rows_selection:
+                self._rows_selection.add(curIdx.data())
+            self.selectIndices()
+        else:
+            self._rows_selection.clear()
+            self._rows_selection.add(curIdx.data())
+
+    def onKeyDown(self):
+        prevIdx = self.selectionModel().currentIndex()
+        curRow = prevIdx.row()
+        if curRow <= self.maxRowsInViewport:
+            curRow += 1
+        curIdx = self.model().index(curRow, self.trackingCol)
+        curData = curIdx.data()
+        prevData = prevIdx.data()
+        # last row+1 of the viewport may be invalid to obtain the row values,
+        # but still needed to scroll to the next row or results.
+        if curIdx.row() == -1:
+            curIdx = self.model().index(curRow-1, self.trackingCol)
+        viewport_row = self.getViewportRowPos(curRow)
+        offset = self.model().queryOffset
+        limit = self.model().queryLimit
+
+        if not self.shiftPressed and not self.ctrlPressed and not self.keySelectAll:
+            self.selectionModel().clear()
+            self._rows_selection.clear()
+
+            self._first_row_selected = curRow
+            self._db_selection_range['first'] = viewport_row + offset
+        self._db_selection_range['last'] = viewport_row + offset
+        self._last_row_selected = curRow
+        if self._first_row_selected > self._last_row_selected:
+            last_r = self._last_row_selected
+            self._last_row_selected = self._first_row_selected
+            self._first_row_selected = last_r
+
+        toggle = True
+        if curData is not None:
+            # handle row selection range expansion/shrinkage
+            # if row is selected, toggle current row and remove latest row from
+            # the selected rows.
+            if curData in self._rows_selection:
+                self._toggleRow(curIdx.row())
+                if prevData in self._rows_selection:
+                    self._rows_selection.remove(prevData)
+                    toggle = False
+            else:
+                self._rows_selection.add(curData)
+
+        newValue = self.vScrollBar.value()
+        if self.shiftPressed or self.ctrlPressed:
+            self.selectIndices()
+        if toggle:
+            self._toggleRow(curRow)
+
+        # if the current row is off the view, we need to force a scrollbar
+        # movement, which will cause a refresh of the viewport.
+        # Once the viewport is refreshed, previous index and row numbers will
+        # be different.
+        if curRow >= self.maxRowsInViewport:
+            if self.vScrollBar.value() == self.vScrollBar.maximum()-1 and offset > 0:
+                self.vScrollBar.blockSignals(True)
+                self.vScrollBar.setValue(newValue-1)
+                self.vScrollBar.blockSignals(False)
+            self.vScrollBar.setValue(newValue+1)
+            self.selectionModel().clear()
+
+            # new view, new rows. Select first row.
+            if viewport_row > limit:
+                self._selectRow(0)
+            else:
+                self._selectLastRow()
+
+            # obtain again current index and add it to the selected rows.
+            curIdx = self.selectionModel().currentIndex()
+            curData = curIdx.data()
+            if curData is not None and curData not in self._rows_selection:
+                self._rows_selection.add(curData)
+            self.selectIndices()
+
+        # BUG (likely): when fetching the previous batch of results, sometimes
+        # not all rows are added. For example, instead of adding 18 rows, only 17 are added.
+        # As a result, the previous batch of results aren't fetched until you
+        # move the scrollbar to trigger a repaint event.
+        elif curRow >= self.maxRowsInViewport-1 and self.vScrollBar.value() == self.vScrollBar.maximum()-1:
+            self.vScrollBar.setValue(newValue+1)
+            self.vScrollBar.blockSignals(True)
+            self.vScrollBar.setValue(0)
+            self.vScrollBar.blockSignals(False)
+            self.selectionModel().clear()
+            if viewport_row >= limit:
+                curIdx = self.model().index(0, self.trackingCol)
+                if curIdx.data() is not None and curIdx.data() not in self._rows_selection:
+                    self._rows_selection.add(curIdx.data())
+                self._selectRow(0)
+        elif curRow >= self.model().totalRowCount:
+            self._selectLastRow()
+
+    def onKeyHome(self):
+        self._last_row_selected = self._first_row_selected
+        self._first_row_selected = 0
+        self._db_selection_range['last'] = self._db_selection_range['first']
+        self._db_selection_range['first'] = 0
+        self.vScrollBar.blockSignals(True)
+        self.vScrollBar.setValue(0)
+        self.vScrollBar.blockSignals(False)
+        if not self.mousePressed and not self.shiftPressed:
+            self.selectionModel().clear()
+        if self.shiftPressed:
+            self.selectDbRows(self._first_row_selected-1, self._last_row_selected)
+        self._selectRow(0)
+
+    def onKeyEnd(self):
+        self.vScrollBar.setValue(self.vScrollBar.maximum())
+        if not self.mousePressed and not self.shiftPressed and not self.ctrlPressed:
+            self.selectionModel().clear()
+        self._last_row_selected = self.getMaxViewportRow()
+        if self.shiftPressed:
+            self.selectDbRows(self._first_row_selected-2, self._last_row_selected)
+        self._selectLastRow()
+
+    def onKeyPageUp(self):
+        if self.vScrollBar.isVisible() is False:
+            return
+        offset = self.model().queryOffset
+        last_idx = self.selectionModel().currentIndex()
+        last_row = last_idx.row()
+        viewport_row = self.getViewportRowPos(last_row)
+        last_row = viewport_row
+        vbar_pos = self.vScrollBar.value()
+        view_top = max(0, vbar_pos - self.maxRowsInViewport)
+        if view_top == 0 and self._first_row_selected == self._last_row_selected and offset > 0:
+            # if the view gets stuck on the first row, fake a little movement
+            # to force a refresh.
+            self.vScrollBar.blockSignals(True)
+            self.vScrollBar.setValue(view_top+1)
+            self.vScrollBar.blockSignals(False)
+            self.vScrollBar.setValue(view_top-1)
+        else:
+            self.vScrollBar.setValue(view_top)
+        self._selectRow(0)
+
+        # obtain again the query offset, the query may have paginated
+        offset = self.model().queryOffset
+        cur_idx = self.selectionModel().currentIndex()
+        cur_row = cur_idx.row()+1
+        viewport_row = self.getViewportRowPos(cur_row)
+        cur_row = viewport_row
+        self._first_row_selected = last_row+offset
+        self._db_selection_range['first'] = cur_row+offset-1
+
+        if self.shiftPressed:
+            self._first_row_selected = cur_row+offset-1
+            self.selectDbRows(self._db_selection_range['first']-2, self._db_selection_range['last'])
+        if not self.shiftPressed and not self.ctrlPressed and not self.keySelectAll:
+            self._first_row_selected = cur_row+offset-1
+            self._last_row_selected = cur_row+offset-1
+            self._db_selection_range['last'] = cur_row+offset-1
+            self._rows_selection.clear()
+            self._rows_selection.add(cur_idx.data())
+
+    def onKeyPageDown(self):
+        if self.vScrollBar.isVisible() is False:
+            return
+        # NOTES:
+        # when paginating a view we need to obtain the first and last row in 2
+        # steps: before setting scrollbar new value, and after setting it.
+        # The reason is that setting a scrollbar value triggers
+        # onScrollbarValueChanged.
+        # BUG: not all rows are visually selected (internally yes).
+        offset = self.model().queryOffset
+        last_idx = self.selectionModel().currentIndex()
+        last_row = last_idx.row()
+        viewport_row = self.getViewportRowPos(last_row)
+        last_row = viewport_row+offset
+        vbar_pos = self.vScrollBar.value()
+        view_top = vbar_pos + self.maxRowsInViewport
+        self.vScrollBar.setValue(view_top)
+        self._selectLastRow()
+
+        # obtain again the query offset, the query may have paginated
+        offset = self.model().queryOffset
+        cur_idx = self.selectionModel().currentIndex()
+        cur_row = cur_idx.row()+1
+        viewport_row = self.getViewportRowPos(cur_row)
+        cur_row = viewport_row+offset
+        self._last_row_selected = cur_row-1
+        # only update last selection, to expand the selected rows
+        self._db_selection_range['last'] = cur_row-1
+
+        if self.shiftPressed:
+            self.selectDbRows(self._db_selection_range['first'], self._db_selection_range['last'])
+        if not self.shiftPressed and not self.ctrlPressed:
+            self._db_selection_range['first'] = last_row
+            self._rows_selection.clear()
+            self._rows_selection.add(last_idx.data())
+            self._first_row_selected = cur_row-1
+            self._last_row_selected = cur_row-1
+
+    def onKeySpace(self):
+        if self.vScrollBar.isVisible() is False:
+            return
+
+        prevValue = self.vScrollBar.value() + (self.maxRowsInViewport-2)
+        newValue = prevValue
+        prevValue = self.getViewportRowPos(prevValue)
+        self.vScrollBar.setValue(newValue)
+        newValue = self.vScrollBar.value() + (self.maxRowsInViewport-2)
+        newValue = self.getViewportRowPos(newValue)
+        if self.shiftPressed:
+            if self._first_row_selected is None:
+                self._first_row_selected = prevValue
+            self._db_selection_range['last'] = newValue
+        else:
+            self._db_selection_range['first'] = newValue
+            self._db_selection_range['last'] = newValue
+        self.selectDbRows(self._db_selection_range['first']-2, self._db_selection_range['last'])
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.KeyRelease:
+            if event.key() == Qt.Key.Key_Shift:
+                self.shiftPressed = False
+            if event.key() == Qt.Key.Key_Control:
+                self.ctrlPressed = False
+
+        elif event.type() == QEvent.Type.KeyPress:
+            # FIXME: setValue() does not update the scrollbars correctly in
+            # some pyqt versions.
+            if event.key() == Qt.Key.Key_Up:
+                self.onKeyUp()
+                # all done, keyUp event already handled.
+                return True
+            elif event.key() == Qt.Key.Key_Down:
+                self.onKeyDown()
+                # all done, keyDown event already handled.
+                return True
+            elif event.key() == Qt.Key.Key_Home:
+                self.onKeyHome()
+            elif event.key() == Qt.Key.Key_End:
+                self.onKeyEnd()
+            elif event.key() == Qt.Key.Key_PageUp:
+                self.onKeyPageUp()
+            elif event.key() == Qt.Key.Key_PageDown:
+                self.onKeyPageDown()
+            elif event.key() == Qt.Key.Key_Escape:
+                self.clearSelection()
+            elif event.key() == Qt.Key.Key_Shift:
+                self.shiftPressed = True
+            elif event.key() == Qt.Key.Key_Control:
+                self.ctrlPressed = True
+            elif event.key() == Qt.Key.Key_Space:
+                self.onKeySpace()
+
+        elif event.type() == QEvent.Type.Wheel:
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                hBar = self.horizontalScrollBar()
+                delta = event.angleDelta().y()
+                step = hBar.singleStep() * 2
+                hBar.setValue(hBar.value() - (step if delta > 0 else -step))
+                return True
+
+            if event.angleDelta().y() != 0:
+                self.vScrollBar.wheelEvent(event)
+                return True
+
+        return super(GenericTableView, self).eventFilter(obj, event)

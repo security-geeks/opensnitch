@@ -7,6 +7,8 @@ import (
 	"syscall"
 
 	"github.com/evilsocket/opensnitch/daemon/log"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // GetSocketInfo asks the kernel via netlink for a given connection.
@@ -39,13 +41,20 @@ func GetSocketInfo(proto string, srcIP net.IP, srcPort uint, dstIP net.IP, dstPo
 			ipproto = syscall.IPPROTO_UDPLITE
 		}
 	}
+	if protoLen >= 4 && proto[:4] == "sctp" {
+		ipproto = syscall.IPPROTO_SCTP
+	}
+	if protoLen >= 4 && proto[:4] == "icmp" {
+		ipproto = syscall.IPPROTO_RAW
+	}
 	if sockList, err := SocketGet(family, ipproto, uint16(srcPort), uint16(dstPort), srcIP, dstIP); err == nil {
 		for n, sock := range sockList {
 			if sock.UID != 0xffffffff {
 				uid = int(sock.UID)
 			}
-			log.Debug("[%d/%d] outgoing connection: %d:%v -> %v:%d || netlink response: %d:%v -> %v:%d inode: %d - loopback: %v multicast: %v unspecified: %v linklocalunicast: %v ifaceLocalMulticast: %v GlobalUni: %v ",
+			log.Debug("[%d/%d] outgoing connection uid: %d, %d:%v -> %v:%d || netlink response: %d:%v -> %v:%d inode: %d - loopback: %v multicast: %v unspecified: %v linklocalunicast: %v ifaceLocalMulticast: %v GlobalUni: %v ",
 				n, len(sockList),
+				int(sock.UID),
 				srcPort, srcIP, dstIP, dstPort,
 				sock.ID.SourcePort, sock.ID.Source,
 				sock.ID.Destination, sock.ID.DestinationPort, sock.INode,
@@ -62,14 +71,11 @@ func GetSocketInfo(proto string, srcIP net.IP, srcPort uint, dstIP net.IP, dstPo
 				((sock.ID.Destination.IsGlobalUnicast() || sock.ID.Destination.IsLoopback()) && sock.ID.Destination.Equal(dstIP)) {
 				inodes = append([]int{int(sock.INode)}, inodes...)
 				continue
-			} else if sock.ID.SourcePort == uint16(srcPort) && sock.ID.Source.Equal(srcIP) &&
-				(sock.ID.DestinationPort == uint16(dstPort)) {
-				inodes = append([]int{int(sock.INode)}, inodes...)
-				continue
 			}
 			log.Debug("GetSocketInfo() invalid: %d:%v -> %v:%d", sock.ID.SourcePort, sock.ID.Source, sock.ID.Destination, sock.ID.DestinationPort)
 		}
 
+		// handle special cases (see function description): ntp queries (123), broadcasts, incomming connections.
 		if len(inodes) == 0 && len(sockList) > 0 {
 			for n, sock := range sockList {
 				if sockList[n].ID.Destination.Equal(net.IPv4zero) || sockList[n].ID.Destination.Equal(net.IPv6zero) {
@@ -79,6 +85,10 @@ func GetSocketInfo(proto string, srcIP net.IP, srcPort uint, dstIP net.IP, dstPo
 						sockList[n].ID.SourcePort, sockList[n].ID.Source,
 						sockList[n].ID.Destination, sockList[n].ID.DestinationPort,
 						sockList[n].INode, TCPStatesMap[sock.State])
+				} else if sock.ID.SourcePort == uint16(srcPort) && sock.ID.Source.Equal(srcIP) &&
+					(sock.ID.DestinationPort == uint16(dstPort)) {
+					inodes = append([]int{int(sock.INode)}, inodes...)
+					continue
 				} else {
 					log.Debug("netlink socket not found, EXCLUDING entry:  %d:%v -> %v:%d || %d:%v -> %v:%d inode: %d state: %s",
 						srcPort, srcIP, dstIP, dstPort,
@@ -143,9 +153,83 @@ func KillSocket(proto string, srcIP net.IP, srcPort uint, dstIP net.IP, dstPort 
 
 	if sockList, err := SocketGet(family, ipproto, uint16(srcPort), uint16(dstPort), srcIP, dstIP); err == nil {
 		for _, s := range sockList {
-			if err := socketKill(family, ipproto, s.ID); err != nil {
-				log.Debug("Unable to kill socket:", srcPort, dstPort, err)
+			if err := SocketKill(family, ipproto, s.ID); err != nil {
+				log.Debug("Unable to kill socket: %d, %d, %v", srcPort, dstPort, err)
 			}
 		}
 	}
+}
+
+// KillSockets kills all sockets given a family and a protocol.
+// Be careful if you don't exclude local sockets, many local servers may misbehave,
+// entering in an infinite loop.
+func KillSockets(fam, proto uint8, excludeLocal bool) error {
+	sockListTCP, err := SocketsDump(fam, proto)
+	if err != nil {
+		return fmt.Errorf("eBPF could not dump TCP (%d/%d) sockets via netlink: %v", fam, proto, err)
+	}
+
+	for _, sock := range sockListTCP {
+		if sock == nil {
+			continue
+		}
+		if excludeLocal && (isPrivate(sock.ID.Destination) ||
+			sock.ID.Source.IsUnspecified() ||
+			sock.ID.Destination.IsUnspecified()) {
+			log.Trace("not killing socket: %+v", sock.ID)
+			continue
+		}
+		log.Trace("killing socket: %+v", sock.ID)
+		if err := SocketKill(fam, proto, sock.ID); err != nil {
+			log.Trace("Unable to kill socket (%+v): %s", sock.ID, err)
+		}
+	}
+
+	return nil
+}
+
+// KillAllSockets kills the sockets for the given families and protocols.
+func KillAllSockets() {
+	type opts struct {
+		fam   uint8
+		proto uint8
+	}
+	optList := []opts{
+		// add families and protos as wish
+		{unix.AF_INET, uint8(syscall.IPPROTO_TCP)},
+		{unix.AF_INET6, uint8(syscall.IPPROTO_TCP)},
+		{unix.AF_INET, uint8(syscall.IPPROTO_UDP)},
+		{unix.AF_INET6, uint8(syscall.IPPROTO_UDP)},
+		{unix.AF_INET, uint8(syscall.IPPROTO_SCTP)},
+		{unix.AF_INET6, uint8(syscall.IPPROTO_SCTP)},
+	}
+	for _, opt := range optList {
+		KillSockets(opt.fam, opt.proto, true)
+	}
+
+}
+
+// FlushConnections flushes conntrack as soon as netfilter rule is set.
+// This ensures that already-established connections will go to netfilter queue.
+func FlushConnections() {
+	if err := netlink.ConntrackTableFlush(netlink.ConntrackTable); err != nil {
+		log.Error("error flushing ConntrackTable %s", err)
+	}
+	if err := netlink.ConntrackTableFlush(netlink.ConntrackExpectTable); err != nil {
+		log.Error("error flusing ConntrackExpectTable %s", err)
+	}
+
+	// Force established connections to reestablish again.
+	KillAllSockets()
+}
+
+// SocketsAreEqual compares 2 different sockets to see if they match.
+func SocketsAreEqual(aSocket, bSocket *Socket) bool {
+	return ((*aSocket).INode == (*bSocket).INode &&
+		//inodes are unique enough, so the matches below will never have to be checked
+		(*aSocket).ID.SourcePort == (*bSocket).ID.SourcePort &&
+		(*aSocket).ID.Source.Equal((*bSocket).ID.Source) &&
+		(*aSocket).ID.Destination.Equal((*bSocket).ID.Destination) &&
+		(*aSocket).ID.DestinationPort == (*bSocket).ID.DestinationPort &&
+		(*aSocket).UID == (*bSocket).UID)
 }

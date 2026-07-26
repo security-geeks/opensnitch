@@ -21,12 +21,6 @@ const (
 	sizeofSocket        = sizeofSocketID + 0x18
 )
 
-var (
-	native       = nl.NativeEndian()
-	networkOrder = binary.BigEndian
-	TCP_ALL      = uint32(0xfff)
-)
-
 // https://elixir.bootlin.com/linux/latest/source/include/net/tcp_states.h
 const (
 	TCP_INVALID = iota
@@ -41,8 +35,14 @@ const (
 	TCP_LAST_ACK
 	TCP_LISTEN
 	TCP_CLOSING
-	TCP_NEW_SYN_REC
+	TCP_NEW_SYN_RECV
 	TCP_MAX_STATES
+)
+
+var (
+	native       = nl.NativeEndian()
+	networkOrder = binary.BigEndian
+	TCP_ALL      = uint32(1<<TCP_ESTABLISHED | 1<<TCP_SYN_SENT | 1<<TCP_SYN_RECV | 1<<TCP_FIN_WAIT1 | 1<<TCP_FIN_WAIT2 | 1<<TCP_TIME_WAIT | 1<<TCP_CLOSE | 1<<TCP_CLOSE_WAIT | 1<<TCP_LAST_ACK | 1<<TCP_LISTEN | 1<<TCP_CLOSING | 1<<TCP_NEW_SYN_RECV | 0x2001)
 )
 
 // TCPStatesMap holds the list of TCP states
@@ -63,36 +63,36 @@ var TCPStatesMap = map[uint8]string{
 
 // SocketID holds the socket information of a request/response to the kernel
 type SocketID struct {
-	SourcePort      uint16
-	DestinationPort uint16
 	Source          net.IP
 	Destination     net.IP
-	Interface       uint32
 	Cookie          [2]uint32
+	Interface       uint32
+	SourcePort      uint16
+	DestinationPort uint16
 }
 
 // Socket represents a netlink socket.
 type Socket struct {
-	Family  uint8
-	State   uint8
-	Timer   uint8
-	Retrans uint8
 	ID      SocketID
 	Expires uint32
 	RQueue  uint32
 	WQueue  uint32
 	UID     uint32
 	INode   uint32
+	Family  uint8
+	State   uint8
+	Timer   uint8
+	Retrans uint8
 }
 
 // SocketRequest holds the request/response of a connection to the kernel
 type SocketRequest struct {
+	ID       SocketID
+	States   uint32
 	Family   uint8
 	Protocol uint8
 	Ext      uint8
 	pad      uint8
-	States   uint32
-	ID       SocketID
 }
 
 type writeBuffer struct {
@@ -125,10 +125,8 @@ func (r *SocketRequest) Serialize() []byte {
 		copy(b.Next(16), r.ID.Source)
 		copy(b.Next(16), r.ID.Destination)
 	} else {
-		copy(b.Next(4), r.ID.Source.To4())
-		b.Next(12)
-		copy(b.Next(4), r.ID.Destination.To4())
-		b.Next(12)
+		copy(b.Next(16), r.ID.Source.To4())
+		copy(b.Next(16), r.ID.Destination.To4())
 	}
 	native.PutUint32(b.Next(4), r.ID.Interface)
 	native.PutUint32(b.Next(4), r.ID.Cookie[0])
@@ -188,7 +186,7 @@ func (s *Socket) deserialize(b []byte) error {
 }
 
 // SocketKill kills a connection
-func socketKill(family, proto uint8, sockID SocketID) error {
+func SocketKill(family, proto uint8, sockID SocketID) error {
 
 	sockReq := &SocketRequest{
 		Family:   family,
@@ -231,11 +229,11 @@ func SocketsDump(family uint8, proto uint8) ([]*Socket, error) {
 		Protocol: proto,
 		States:   TCP_ALL,
 	}
-	return netlinkRequest(sockReq, 0, 0, 0, 0, nil, nil)
+	return netlinkRequest(sockReq, family, proto, 0, 0, nil, nil)
 }
 
 func netlinkRequest(sockReq *SocketRequest, family uint8, proto uint8, srcPort, dstPort uint16, local, remote net.IP) ([]*Socket, error) {
-	req := nl.NewNetlinkRequest(nl.SOCK_DIAG_BY_FAMILY, syscall.NLM_F_DUMP)
+	req := nl.NewNetlinkRequest(nl.SOCK_DIAG_BY_FAMILY, syscall.NLM_F_REQUEST|syscall.NLM_F_DUMP)
 	req.AddData(sockReq)
 	msgs, err := req.Execute(syscall.NETLINK_INET_DIAG, 0)
 	if err != nil {
@@ -244,7 +242,7 @@ func netlinkRequest(sockReq *SocketRequest, family uint8, proto uint8, srcPort, 
 	if len(msgs) == 0 {
 		return nil, errors.New("Warning, no message nor error from netlink, or no connections found")
 	}
-	var sock []*Socket
+	sock := make([]*Socket, len(msgs))
 	for n, m := range msgs {
 		s := &Socket{}
 		if err = s.deserialize(m); err != nil {
@@ -254,11 +252,9 @@ func netlinkRequest(sockReq *SocketRequest, family uint8, proto uint8, srcPort, 
 				s.ID.SourcePort, s.ID.Source, s.ID.Destination, s.ID.DestinationPort)
 			continue
 		}
-		if s.INode == 0 {
-			continue
-		}
-
-		sock = append([]*Socket{s}, sock...)
+		// INode can be zero for some connections states, like TCP_FIN_WAT, TCP_TIME_WAIT, etc.
+		// so don't exclude those entries, in order to get all sockets.
+		sock[n] = s
 	}
 	return sock, err
 }

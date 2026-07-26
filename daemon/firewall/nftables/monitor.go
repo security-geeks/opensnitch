@@ -1,6 +1,10 @@
 package nftables
 
 import (
+	"time"
+
+	"github.com/evilsocket/opensnitch/daemon/firewall/common"
+	"github.com/evilsocket/opensnitch/daemon/firewall/nftables/exprs"
 	"github.com/evilsocket/opensnitch/daemon/log"
 )
 
@@ -10,37 +14,38 @@ func (n *Nft) AreRulesLoaded() bool {
 	defer n.Unlock()
 
 	nRules := 0
-	for _, table := range n.mangleTables {
-		rules, err := n.conn.GetRule(table, n.outputChains[table])
-		if err != nil {
-			log.Error("nftables mangle rules error:", table.Name, n.outputChains[table].Name)
-			return false
-		}
-		for _, r := range rules {
-			if string(r.UserData) == fwKey {
-				nRules++
-			}
-		}
-	}
-	if nRules != 2 {
-		log.Warning("nftables mangle rules not loaded: %d", nRules)
+	chains, err := n.Conn.ListChains()
+	if err != nil {
+		log.Warning("[nftables] error listing nftables chains: %s", err)
 		return false
 	}
 
-	nRules = 0
-	for _, table := range n.filterTables {
-		rules, err := n.conn.GetRule(table, n.inputChains[table])
-		if err != nil {
-			log.Error("nftables filter rules error:", table.Name, n.inputChains[table].Name)
-			return false
+	for _, c := range chains {
+		if c.Table.Name != exprs.TABLE_OPENSNITCH {
+			continue
 		}
-		for _, r := range rules {
-			if string(r.UserData) == fwKey {
+		rules, err := n.Conn.GetRule(c.Table, c)
+		if err != nil {
+			log.Warning("[nftables] Error listing rules: %s", err)
+			continue
+		}
+		for rdx, r := range rules {
+			if string(r.UserData) == InterceptionRuleKey {
+				if c.Name == exprs.CHAIN_FILTER_INPUT && rdx != 0 {
+					log.Warning("nftables DNS rule not in 1st position (%d)", rdx)
+					return false
+				}
 				nRules++
+				if c.Name == exprs.CHAIN_MANGLE_OUTPUT && rdx < len(rules)-2 {
+					log.Warning("nftables queue rule is not the latest of the list (%d/%d), reloading", rdx, len(rules))
+					return false
+				}
 			}
 		}
 	}
-	if nRules != 2 {
+	// we expect to have exactly 3 rules (2 queue and 1 dns). If there're less or more, then we
+	// need to reload them.
+	if nRules != 3 {
 		log.Warning("nfables filter rules not loaded: %d", nRules)
 		return false
 	}
@@ -48,8 +53,23 @@ func (n *Nft) AreRulesLoaded() bool {
 	return true
 }
 
-func (n *Nft) reloadRulesCallback() {
+// ReloadConfCallback gets called after the configuration changes.
+func (n *Nft) ReloadConfCallback() {
+	log.Important("reloadConfCallback changed, reloading")
+	n.DeleteSystemRules(!common.ForcedDelRules, !common.RestoreChains, log.GetLogLevel() == log.DEBUG)
+	n.AddSystemRules(common.ReloadRules, !common.BackupChains)
+}
+
+// ReloadRulesCallback gets called when the interception rules are not present.
+func (n *Nft) ReloadRulesCallback() {
 	log.Important("nftables firewall rules changed, reloading")
-	n.AddSystemRules()
-	n.InsertRules()
+	n.DisableInterception(log.GetLogLevel() == log.DEBUG)
+	time.Sleep(time.Millisecond * 500)
+	n.EnableInterception()
+}
+
+// PreloadConfCallback gets called before the fw configuration is loaded
+func (n *Nft) PreloadConfCallback() {
+	log.Info("nftables config changed, reloading")
+	n.DeleteSystemRules(!common.ForcedDelRules, common.RestoreChains, log.GetLogLevel() == log.DEBUG)
 }

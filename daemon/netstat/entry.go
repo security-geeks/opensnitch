@@ -11,9 +11,10 @@ import (
 type Entry struct {
 	Proto   string
 	SrcIP   net.IP
-	SrcPort uint
 	DstIP   net.IP
+	SrcPort uint
 	DstPort uint
+	Iface   int
 	UserId  int
 	INode   int
 }

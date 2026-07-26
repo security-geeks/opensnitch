@@ -1,10 +1,11 @@
 package procmon
 
 import (
-	"fmt"
 	"os"
 	"sort"
 	"strconv"
+
+	"github.com/evilsocket/opensnitch/daemon/core"
 )
 
 func sortPidsByTime(fdList []os.FileInfo) []os.FileInfo {
@@ -22,14 +23,14 @@ func sortPidsByTime(fdList []os.FileInfo) []os.FileInfo {
 //
 // If the inode is found, the cache is updated ans sorted.
 func inodeFound(pidsPath, expect, inodeKey string, inode, pid int) bool {
-	fdPath := fmt.Sprint(pidsPath, pid, "/fd/")
+	fdPath := core.ConcatStrings(pidsPath, strconv.Itoa(pid), "/fd/")
 	fdList := lookupPidDescriptors(fdPath, pid)
 	if fdList == nil {
 		return false
 	}
 
 	for idx := 0; idx < len(fdList); idx++ {
-		descLink := fmt.Sprint(fdPath, fdList[idx])
+		descLink := core.ConcatStrings(fdPath, fdList[idx])
 		if link, err := os.Readlink(descLink); err == nil && link == expect {
 			inodesCache.add(inodeKey, descLink, pid)
 			pidsCache.add(fdPath, fdList, pid)
@@ -83,18 +84,19 @@ func lookupPidDescriptors(fdPath string, pid int) []string {
 }
 
 // getProcPids returns the list of running PIDs, /proc or /proc/<pid>/task/ .
-func getProcPids(pidsPath string) (pidList []int) {
+func getProcPids(pidsPath string) []int {
 	f, err := os.Open(pidsPath)
 	if err != nil {
-		return pidList
+		return []int{}
 	}
 	ls, err := f.Readdir(-1)
 	f.Close()
 	if err != nil {
-		return pidList
+		return []int{}
 	}
 	ls = sortPidsByTime(ls)
 
+	pidList := make([]int, 0, len(ls))
 	for _, f := range ls {
 		if f.IsDir() == false {
 			continue

@@ -1,13 +1,18 @@
 package iptables
 
 import (
+	"bytes"
+	"encoding/json"
 	"os/exec"
 	"regexp"
+	"strings"
 	"sync"
 
 	"github.com/evilsocket/opensnitch/daemon/firewall/common"
 	"github.com/evilsocket/opensnitch/daemon/firewall/config"
 	"github.com/evilsocket/opensnitch/daemon/log"
+	"github.com/evilsocket/opensnitch/daemon/ui/protocol"
+	"github.com/golang/protobuf/jsonpb"
 )
 
 // Action is the modifier we apply to a rule.
@@ -28,27 +33,37 @@ const (
 	FLUSH    = Action("-F")
 	NEWCHAIN = Action("-N")
 	DELCHAIN = Action("-X")
+	POLICY   = Action("-P")
+
+	DROP   = Action("DROP")
+	ACCEPT = Action("ACCEPT")
 )
 
-// SystemChains holds the fw rules defined by the user
+// SystemRule blabla
+type SystemRule struct {
+	Rule  *config.FwRule
+	Table string
+	Chain string
+}
+
+// SystemChains keeps track of the fw rules that have been added to the system.
 type SystemChains struct {
+	Rules map[string]*SystemRule
 	sync.RWMutex
-	Rules map[string]config.FwRule
 }
 
 // Iptables struct holds the fields of the iptables fw
 type Iptables struct {
-	sync.Mutex
-	config.Config
-	common.Common
-
-	bin  string
-	bin6 string
-
 	regexRulesQuery       *regexp.Regexp
 	regexSystemRulesQuery *regexp.Regexp
+	bin                   string
+	bin6                  string
+	chains                SystemChains
+	bypassQueue           bool
+	common.Common
+	config.Config
 
-	chains SystemChains
+	sync.Mutex
 }
 
 // Fw initializes a new Iptables object
@@ -57,7 +72,7 @@ func Fw() (*Iptables, error) {
 		return nil, err
 	}
 
-	reRulesQuery, _ := regexp.Compile(`NFQUEUE.*ctstate NEW,RELATED.*NFQUEUE num.*bypass`)
+	reRulesQuery, _ := regexp.Compile(`NFQUEUE.*ctstate NEW,RELATED.*NFQUEUE num.*`)
 	reSystemRulesQuery, _ := regexp.Compile(SystemRulePrefix + ".*")
 
 	ipt := &Iptables{
@@ -65,7 +80,9 @@ func Fw() (*Iptables, error) {
 		bin6:                  "ip6tables",
 		regexRulesQuery:       reRulesQuery,
 		regexSystemRulesQuery: reSystemRulesQuery,
-		chains:                SystemChains{Rules: make(map[string]config.FwRule)},
+		chains: SystemChains{
+			Rules: make(map[string]*SystemRule),
+		},
 	}
 	return ipt, nil
 }
@@ -77,31 +94,32 @@ func (ipt *Iptables) Name() string {
 
 // Init inserts the firewall rules and starts monitoring for firewall
 // changes.
-func (ipt *Iptables) Init(qNum *int) {
+func (ipt *Iptables) Init(qNum uint16, configPath, monitorInterval string, bypassQueue bool) {
 	if ipt.IsRunning() {
 		return
 	}
+	ipt.bypassQueue = bypassQueue
 	ipt.SetQueueNum(qNum)
+	ipt.SetRulesCheckerInterval(monitorInterval)
+	ipt.ErrChan = make(chan string, 100)
 
 	// In order to clean up any existing firewall rule before start,
-	// we need to load the fw configuration first.
-	ipt.NewSystemFwConfig(ipt.preloadConfCallback)
-	go ipt.MonitorSystemFw(ipt.AddSystemRules)
-	ipt.LoadDiskConfiguration(false)
+	// we need to load the fw configuration first to know what rules
+	// were configured.
+	ipt.NewSystemFwConfig(configPath, ipt.preloadConfCallback, ipt.reloadRulesCallback)
+	ipt.LoadDiskConfiguration(!common.ReloadConf)
 
 	// start from a clean state
 	ipt.CleanRules(false)
-	ipt.InsertRules()
-
-	ipt.AddSystemRules()
-	// start monitoring firewall rules to intercept network traffic
-	ipt.NewRulesChecker(ipt.AreRulesLoaded, ipt.reloadRulesCallback)
+	ipt.EnableInterception()
+	ipt.AddSystemRules(!common.ReloadRules, common.BackupChains)
 
 	ipt.Running = true
 }
 
 // Stop deletes the firewall rules, allowing network traffic.
 func (ipt *Iptables) Stop() {
+	ipt.ErrChan = make(chan string, 100)
 	if ipt.Running == false {
 		return
 	}
@@ -113,6 +131,7 @@ func (ipt *Iptables) Stop() {
 }
 
 // IsAvailable checks if iptables is installed in the system.
+// If it's not, we'll default to nftables.
 func IsAvailable() error {
 	_, err := exec.Command("iptables", []string{"-V"}...).CombinedOutput()
 	if err != nil {
@@ -121,18 +140,64 @@ func IsAvailable() error {
 	return nil
 }
 
-// InsertRules adds fw rules to intercept connections
-func (ipt *Iptables) InsertRules() {
-	if err4, err6 := ipt.QueueDNSResponses(true, true); err4 != nil || err6 != nil {
-		log.Error("Error while running DNS firewall rule: %s %s", err4, err6)
-	} else if err4, err6 = ipt.QueueConnections(true, true); err4 != nil || err6 != nil {
+// EnableInterception adds fw rules to intercept connections.
+func (ipt *Iptables) EnableInterception() {
+	if err4, err6 := ipt.QueueConnections(common.EnableRule, true); err4 != nil || err6 != nil {
 		log.Fatal("Error while running conntrack firewall rule: %s %s", err4, err6)
+	} else if err4, err6 = ipt.QueueDNSResponses(common.EnableRule, true); err4 != nil || err6 != nil {
+		log.Error("Error while running DNS firewall rule: %s %s", err4, err6)
 	}
+	// start monitoring firewall rules to intercept network traffic
+	ipt.NewRulesChecker(ipt.AreRulesLoaded, ipt.reloadRulesCallback)
+}
+
+// DisableInterception removes firewall rules to intercept outbound connections.
+func (ipt *Iptables) DisableInterception(logErrors bool) {
+	ipt.StopCheckingRules()
+	ipt.QueueDNSResponses(!common.EnableRule, logErrors)
+	ipt.QueueConnections(!common.EnableRule, logErrors)
 }
 
 // CleanRules deletes the rules we added.
 func (ipt *Iptables) CleanRules(logErrors bool) {
-	ipt.QueueDNSResponses(false, logErrors)
-	ipt.QueueConnections(false, logErrors)
-	ipt.DeleteSystemRules(true, logErrors)
+	ipt.DisableInterception(logErrors)
+	ipt.DeleteSystemRules(common.ForcedDelRules, common.BackupChains, logErrors)
+}
+
+// Serialize converts the configuration from json to protobuf
+func (ipt *Iptables) Serialize() (*protocol.SysFirewall, error) {
+	sysfw := &protocol.SysFirewall{}
+	jun := jsonpb.Unmarshaler{
+		AllowUnknownFields: true,
+	}
+	rawConfig, err := json.Marshal(&ipt.SysConfig)
+	if err != nil {
+		log.Error("nfables.Serialize() struct to string error: %s", err)
+		return nil, err
+	}
+	// string to proto
+	if err := jun.Unmarshal(strings.NewReader(string(rawConfig)), sysfw); err != nil {
+		log.Error("nfables.Serialize() string to protobuf error: %s", err)
+		return nil, err
+	}
+
+	return sysfw, nil
+}
+
+// Deserialize converts a protocolbuffer structure to json.
+func (ipt *Iptables) Deserialize(sysfw *protocol.SysFirewall) ([]byte, error) {
+	jun := jsonpb.Marshaler{
+		OrigName:     true,
+		EmitDefaults: false,
+		Indent:       "  ",
+	}
+
+	var b bytes.Buffer
+	if err := jun.Marshal(&b, sysfw); err != nil {
+		log.Error("nfables.Deserialize() error 2: %s", err)
+		return nil, err
+	}
+	return b.Bytes(), nil
+
+	//return nil, fmt.Errorf("iptables.Deserialize() not implemented")
 }
